@@ -151,6 +151,22 @@ if [ "$c1" -eq 0 ] && [ "$c2" -eq 1 ] && [ "$c3" -eq 0 ]; then
   ok "K kit-doctor: 一致=0 / 漂移=1 / 还原=0"
 else bad "K kit-doctor 漂移检测 (c1=$c1 c2=$c2 c3=$c3)" ""; fi
 
+# ---- O 只传一个失败测试文件：F2 必须真跑并判红（以前的静默跳测 = 假绿灯） ----
+mkdir -p "$W/o"
+printf 'def test_bad():\n    assert 1 == 2\n' > "$W/o/test_only.py"
+run "$W/o/test_only.py"
+if has 'GATE: FAIL (F2)' && ! has 'F3'; then
+  ok "O 只传失败测试文件 → F2 红（不再静默跳测）"
+else bad "O 只传失败测试文件 → F2 红" "$OUT"; fi
+
+# ---- P 只传一个通过测试文件：F2 要真的跑过，不是跳过 ----
+mkdir -p "$W/p"
+printf 'def test_ok():\n    assert True\n' > "$W/p/test_only.py"
+run "$W/p/test_only.py"
+if [ "$CODE" -eq 0 ] && has '✓ F2 pytest PASS'; then
+  ok "P 只传通过测试文件 → F2 真的跑了"
+else bad "P 只传通过测试文件 → F2 真的跑了" "$OUT"; fi
+
 # ---- 汇总 ----
 echo "----------------------------------------"
 echo "SCENARIOS: $pass passed, $fail failed"

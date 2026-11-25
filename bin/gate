@@ -76,12 +76,17 @@ if [ "$s_fail" -eq 1 ]; then log_gate FAIL_S; echo "GATE: FAIL (S)"; exit 1; fi
 # ---------- 展开输入：文件清单 + 目录清单 ----------
 : > "$TMP/list"
 : > "$TMP/dirs"
+: > "$TMP/tfiles"
 for a in "$@"; do
   if [ -d "$a" ]; then
     printf '%s\n' "$a" >> "$TMP/dirs"
     for g in "$a"/*; do [ -f "$g" ] && printf '%s\n' "$g" >> "$TMP/list"; done
   else
     printf '%s\n' "$a" >> "$TMP/list"
+    # 显式点名的测试文件单独记账：只传文件时不会进 dirs，F2 就永远不跑
+    case "$(basename "$a")" in
+      test_*.py|*.test.mjs|tb*.v) printf '%s\n' "$a" >> "$TMP/tfiles" ;;
+    esac
   fi
 done
 NFILES=$(wc -l < "$TMP/list" | tr -d ' ')
@@ -188,8 +193,56 @@ while IFS= read -r d; do
     done
   fi
 done < "$TMP/dirs"
+
+# 显式点名的测试文件也必须真跑：只传文件时它不属于任何 dirs，
+# 直接跳过就会在「改了实现 + 点了测试文件」时报假绿灯。
+if [ -s "$TMP/tfiles" ]; then
+  while IFS= read -r t; do
+    [ -f "$t" ] || continue
+    case "$(basename "$t")" in
+      test_*.py)
+        f2_ran=1
+        if python3 -m pytest -q "$t" > "$TMP/f2py.log" 2>&1; then
+          echo "✓ F2 pytest PASS ($t)"
+        else
+          echo "✗ F2 $t pytest 失败"
+          tail -n 15 "$TMP/f2py.log" | sed 's/^/    /'
+          f2_fail=1
+        fi ;;
+      *.test.mjs)
+        f2_ran=1
+        if command -v node >/dev/null 2>&1; then
+          if node --test "$t" > "$TMP/f2js.log" 2>&1; then
+            echo "✓ F2 node PASS ($t)"
+          else
+            echo "✗ F2 $t node 测试失败"
+            tail -n 15 "$TMP/f2js.log" | sed 's/^/    /'
+            f2_fail=1
+          fi
+        else
+          echo "✗ F2 $t 有 node 测试但没装 node，无法判定（不能判定≠通过）"
+          f2_fail=1
+        fi ;;
+      tb*.v)
+        f2_ran=1
+        d=$(dirname "$t")
+        if ! command -v iverilog >/dev/null 2>&1; then
+          echo "✗ F2 $t 有 tb*.v 但没装 iverilog，无法判定（不能判定≠通过）"
+          f2_fail=1
+          continue
+        fi
+        duts=$(ls "$d"/*.v 2>/dev/null | grep -vE '/tb[^/]*\.v$' | tr '\n' ' ')
+        if iverilog -g2012 -o "$TMP/sim" "$t" $duts 2>/dev/null && vvp "$TMP/sim" >/dev/null 2>&1; then
+          echo "✓ F2 仿真 PASS ($t)"
+        else
+          echo "✗ F2 $t 仿真失败"; f2_fail=1
+        fi ;;
+    esac
+  done < "$TMP/tfiles"
+fi
+
 if [ "$f2_ran" -eq 0 ]; then
-  echo "· F2 未跑：输入里没有测试入口（test_*.py / *.test.mjs / tb*.v）"
+  echo "· F2 未跑：输入里没有测试入口（test_*.py / *.test.mjs / tb*.v，或它们所在的目录）"
 fi
 if [ "$f2_fail" -eq 1 ]; then
   log_gate FAIL_F2; echo "GATE: FAIL (F2)"; exit 1

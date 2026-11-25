@@ -88,7 +88,7 @@ sh scripts/selftest.sh                   # SELFTEST: PASS
 |---|---|---|
 | **S** | 输入里**内容像 task-log** 的 JSON 文件 → 跑 `log-check`。形态判据：任意一条里 `seq`+`ts`，且（命中 ≥6 个必备字段 **或** 带 `legacy` 标记） | 停，`GATE: FAIL (S)` |
 | **F1** | 可解析/可编译/结构合法：`.md` 代码围栏成对、`.json/.jsonl` 能被 `jq` 解析、`.py` 能 `compile`、`.sh` 过 `bash -n`、`.js/.mjs` 过 `node --check`、`.v` 过 `iverilog`、**无扩展名的脚本按 shebang 判**（`bin/gate` 这类自己也受检）。需要的解释器没装 → 判红（不能判定≠通过） | 停，`GATE: FAIL (F1)` |
-| **F2** | 按**目录**跑测试：`test_*.py` → `pytest`、`*.test.mjs` → `node --test`、`tb*.v` → `iverilog`+`vvp`。没有测试入口时打印「F2 未跑」（可见，不算红）；有测试入口但解释器没装 → 判红 | 停，`GATE: FAIL (F2)` |
+| **F2** | 跑测试：`test_*.py` → `pytest`、`*.test.mjs` → `node --test`、`tb*.v` → `iverilog`+`vvp`。入口来自**目录**，也来自**显式点名的测试文件**（只传文件时同样会跑，否则就是假绿灯）。没有测试入口时打印「F2 未跑」（可见，不算红）；有测试入口但解释器没装 → 判红 | 停，`GATE: FAIL (F2)` |
 | **F3** | `qcheck` 的确定性指标：占位符 0 处、非空、合法 UTF-8、CRLF/LF 不混用。全文可解析为 JSON 的**数据文件**不扫占位符（`ph=skip-json`） | 停，`GATE: FAIL (F3)` |
 
 三条设计取舍：
@@ -140,7 +140,7 @@ sh scripts/selftest.sh
 两头都要绿：
 
 - `verify/logcheck`（pytest，**21 passed**）：11 个坏样例分别触发 S1–S11，四条嗅探用例证明 S 关按内容触发（含「全是 legacy 行的老日志」），`status` 三个合法值各一条正例，legacy 两条。
-- `verify/gate`（sh，**14 passed**）：好文件 PASS、S 红即停、F1 红短路 F2、F2 红短路 F3、占位符判红、豁免标记生效、改名日志被 S 接管、普通 jsonl 明确跳过、数据文件不扫占位符、legacy 老日志被接管、缺 node 时判红、缺 `log-check` 时 fail-closed、`gate-log` 记账完整、`kit-doctor` 三态（一致/漂移/还原）。
+- `verify/gate`（sh，**16 passed**）：好文件 PASS、S 红即停、F1 红短路 F2、F2 红短路 F3、占位符判红、豁免标记生效、改名日志被 S 接管、普通 jsonl 明确跳过、数据文件不扫占位符、legacy 老日志被接管、缺 node 时判红、缺 `log-check` 时 fail-closed、`gate-log` 记账完整、`kit-doctor` 三态（一致/漂移/还原）、单文件测试入口跑与不跑各一条（失败判红 / 通过真跑）。
 
 校验器或门改过不跑这两套，等于没改。
 
