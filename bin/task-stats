@@ -1,31 +1,79 @@
 #!/bin/sh
-# task-stats — 任务日志快速统计（v1.0 + legacy 兼容）
+# task-stats — 任务日志快速统计
+#
+# 有 §8 切割事件（record_type:"schema"）时，两套口径分开报，绝不相加：
+#   legacy（seq <= freezes_seq_lte）：只计行数 + 旧 S1 是否干净
+#   v1.2：task / gate / accept 计数，以及 delivered / accepted / open
+# 没有切割事件的旧文件：保持 v1.0 统计不变。
 node -e '
 const fs=require("fs");
 const H=process.env.DSH_HOME||(process.env.HOME+"/.dsh");
 const p=H+"/task-log.jsonl";
 let rows=[];
 try{rows=fs.readFileSync(p,"utf8").split("\n").filter(Boolean).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean)}catch(e){}
+if(!rows.length){console.log("没有记录");process.exit(0)}
 const bucket=r=>{const s=(r.status!==undefined?r.status:r.result);
   if(s==="done"||s==="success")return "success";
   if(s==="blocked"||s==="fail")return "fail";
   if(s==="partial")return "partial";
   return "unknown";};
-const n=rows.length,c={success:0,partial:0,fail:0,unknown:0};
-const verdicts={PASS:0,FAIL:0,UNKNOWN:0};
-let degraded=0,red=0,v10=0;
-rows.forEach(r=>{
-  c[bucket(r)]++;
-  if(r.status!==undefined)v10++;
-  if(r.degraded===true)degraded++;
-  red+=(r.red_attempts||[]).length;
-  (r.acceptance||[]).forEach(a=>{if(verdicts[a.verdict]!==undefined)verdicts[a.verdict]++});
+const pct=(x,n)=>n?Math.round(x/n*100):0;
+
+function oldStats(list,label){
+  const n=list.length,c={success:0,partial:0,fail:0,unknown:0},verdicts={PASS:0,FAIL:0,UNKNOWN:0};
+  let degraded=0,red=0,v10=0;
+  list.forEach(r=>{
+    c[bucket(r)]++;
+    if(r.status!==undefined)v10++;
+    if(r.degraded===true)degraded++;
+    red+=(r.red_attempts||[]).length;
+    (r.acceptance||[]).forEach(a=>{if(verdicts[a.verdict]!==undefined)verdicts[a.verdict]++});
+  });
+  console.log(`[${label}] ${n} 行 | 成功 ${c.success} (${pct(c.success,n)}%) / 部分 ${c.partial} / 失败 ${c.fail}${c.unknown?" / 未知 "+c.unknown:""}`);
+  console.log(`[${label}] 判定 PASS ${verdicts.PASS} / FAIL ${verdicts.FAIL} / UNKNOWN ${verdicts.UNKNOWN} | 返工 ${red} 次 | degraded ${degraded} 条 | 带 status 的 v1.0 行 ${v10}`);
+  const t={};list.forEach(r=>(r.tools||[]).forEach(x=>t[x]=(t[x]||0)+1));
+  const top=Object.entries(t).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>k+"×"+v).join("  ");
+  if(top)console.log(`[${label}] 工具: ${top}`);
+}
+
+const cut=rows.find(r=>r&&r.record_type==="schema");
+if(!cut){ oldStats(rows,"v1.0"); process.exit(0); }
+
+const fz=cut.freezes_seq_lte|0;
+const legacy=rows.filter(r=>typeof r.seq==="number"&&r.seq<=fz);
+const modern=rows.filter(r=>!(typeof r.seq==="number"&&r.seq<=fz));
+let v1ok=true,prev=0,prevTs=null;
+legacy.forEach(r=>{
+  if(typeof r.seq==="number"&&r.seq!==prev+1)v1ok=false;
+  if(typeof r.seq==="number")prev=r.seq;
+  if(typeof r.ts==="string"){if(prevTs!==null&&r.ts<prevTs)v1ok=false;prevTs=r.ts;}
 });
-const pct=x=>n?Math.round(x/n*100):0;
-console.log(`总任务 ${n}（v1.0 ${v10} / legacy ${n-v10}）`);
-console.log(`成功 ${c.success} (${pct(c.success)}%) | 部分 ${c.partial} | 失败 ${c.fail}${c.unknown?", 未知 "+c.unknown:""}`);
-console.log(`外部判定 PASS ${verdicts.PASS} / FAIL ${verdicts.FAIL} / UNKNOWN ${verdicts.UNKNOWN} | 返工 ${red} 次 | degraded ${degraded} 条`);
-const t={};rows.forEach(r=>(r.tools||[]).forEach(x=>t[x]=(t[x]||0)+1));
-console.log("工具(legacy 字段):", Object.entries(t).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>k+"×"+v).join("  ")||"无");
-if(n){const l=rows[n-1];console.log(`最近: seq=${l.seq} [${bucket(l)}] ${l.task}`);}
+console.log(`[legacy] ${legacy.length} 行（seq≤${fz}，只计旧 S1）| 旧 S1: ${v1ok?"干净":"有问题"}`);
+
+const tasks=new Map(),gates=new Map(),acc=[];
+modern.forEach(r=>{
+  if(r.record_type==="task")tasks.set(r.seq,r);
+  else if(r.record_type==="gate"){
+    const k=r.target_seq,cur=gates.get(k);
+    if(!cur||(r.ts||"")>(cur.ts||"")||((r.ts||"")===(cur.ts||"")&&r.seq>cur.seq))gates.set(k,r);
+  } else if(r.record_type==="accept")acc.push(r);
+});
+let delivered=0,accepted=0,open=0;
+tasks.forEach((t,seq)=>{
+  const vmap={};
+  (t.acceptance||[]).forEach(a=>{if(a&&a.id)vmap[a.id]=a.verdict||"PENDING"});
+  const evs=acc.filter(a=>a.target&&a.target.seq===seq).sort((x,y)=>((x.ts||"")+(x.seq)).localeCompare((y.ts||"")+(y.seq)));
+  const whole=evs.filter(a=>!(a.target.criterion_id));
+  evs.forEach(a=>{if(a.target.criterion_id&&vmap[a.target.criterion_id]!==undefined)vmap[a.target.criterion_id]=a.verdict});
+  if(whole.length)Object.keys(vmap).forEach(k=>{if(!evs.some(a=>a.target.criterion_id===k))vmap[k]=whole[whole.length-1].verdict});
+  const g=gates.get(seq);
+  const isDelivered=!!(g&&g.result==="PASS");
+  const vals=Object.values(vmap);
+  const isAccepted=isDelivered&&(vals.length>0?vals.every(v=>v==="PASS")
+                                 :(whole.length>0&&whole[whole.length-1].verdict==="PASS"));
+  if(isAccepted)accepted++;else open++;
+  if(isDelivered)delivered++;
+});
+console.log(`[v1.2] task ${tasks.size} / gate ${gates.size} / accept ${acc.length} → delivered ${delivered} / accepted ${accepted} / open ${open}`);
+console.log("两套口径分开统计，不相加。");
 '

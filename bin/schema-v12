@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""schema-v12 [--file PATH] [--json] [--fold] — dsh-workflow-kit v1.2（V1–V13）
+
+规则编号一律 V*；S1–S10 冻结给 legacy 行，本脚本不再发出 S 号。
+切割只看 §8 的 schema 事件：seq <= freezes_seq_lte 的行按 legacy 处理（只查 V1），
+不回写 legacy 键，也不进 v1.2 的 delivered / accepted / open。
+
+退出码: 0 全过 / 1 有错 / 2 用法或读文件失败。
+"""
+import json, os, re, sys, pathlib
+
+HERE = pathlib.Path(__file__).resolve().parent
+MATRIX = None
+for cand in (HERE.parent / "docs" / "v12-field-matrix.json",
+             pathlib.Path(os.path.expanduser("~/.dsh/docs/v12-field-matrix.json"))):
+    if cand.exists():
+        MATRIX = json.loads(cand.read_text(encoding="utf-8"))
+        break
+
+SECRET = re.compile(r"(sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|"
+                    r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+                    r"\b1[3-9]\d{9}\b|\b[\w.+-]+@[\w-]+\.[\w.]{2,}\b)")
+TIERS = ["lite", "std", "full"]
+
+
+def e(code, ln, msg):
+    return {"code": code, "line": ln, "msg": msg}
+
+
+def is_str(v):
+    return isinstance(v, str) and v.strip() != ""
+
+
+def freetext(name, v, ln):
+    errs = []
+    if not isinstance(v, str):
+        return errs
+    if len(v) > MATRIX["freetext_max"]:
+        errs.append(e("V11", ln, "%s 长度 %d > %d" % (name, len(v), MATRIX["freetext_max"])))
+    m = SECRET.search(v)
+    if m:
+        errs.append(e("V11", ln, "%s 命中敏感模式: %s" % (name, m.group(0)[:12] + "…")))
+    return errs
+
+
+def check_task(r, ln):
+    errs = []
+    tier = r.get("tier")
+    if tier not in TIERS:
+        errs.append(e("V3", ln, "tier 不在枚举 %s: %r" % (TIERS, tier)))
+        tier = None
+    for name, spec in MATRIX["task_fields"].items():
+        mode = spec.get(tier) if tier else "REQ"
+        present = name in r
+        if mode == "REQ" and not present:
+            errs.append(e("V2", ln, "缺 REQ 字段 %s（tier=%s）" % (name, tier)))
+            continue
+        if mode == "FORBID" and present:
+            errs.append(e("V2", ln, "%s 档禁用该键: %s" % (tier, name)))
+            continue
+        if not present:
+            continue
+        v = r[name]
+        t = spec["type"]
+        if t == "string" and not is_str(v):
+            errs.append(e("V2", ln, "%s 必须是非空字符串" % name))
+        elif t == "int" and not (isinstance(v, int) and not isinstance(v, bool)):
+            errs.append(e("V2", ln, "%s 必须是整数" % name))
+        elif t == "boolean" and not isinstance(v, bool):
+            errs.append(e("V2", ln, "%s 必须是布尔" % name))
+        elif t == "array" and not isinstance(v, list):
+            errs.append(e("V2", ln, "%s 必须是数组" % name))
+        elif t == "object|null" and not isinstance(v, dict):
+            errs.append(e("V2", ln, "%s 必须是对象或 null" % name))
+        elif t == "string|null" and not isinstance(v, str):
+            errs.append(e("V2", ln, "%s 必须是字符串或 null" % name))
+        if "enum" in spec and v not in spec["enum"]:
+            errs.append(e("V3", ln, "%s 不在枚举 %s: %r" % (name, spec["enum"], v)))
+        if "const" in spec and v != spec["const"]:
+            errs.append(e("V2", ln, "%s 必须等于 %r" % (name, spec["const"])))
+        if spec.get("freetext"):
+            errs += freetext(name, v, ln)
+
+    ra = r.get("red_attempts")
+    if isinstance(ra, list):
+        if not ra:
+            errs.append(e("V5", ln, "red_attempts 不允许空数组"))
+        need = 1 if tier == "lite" else 3
+        if r.get("status") == "blocked" and len(ra) < need:
+            errs.append(e("V5", ln, "blocked 需要 ≥%d 条 red_attempts，实有 %d" % (need, len(ra))))
+        elif tier == "lite" and r.get("status") != "blocked":
+            errs.append(e("V5", ln, "lite 非 blocked 不得出现 red_attempts"))
+        for i, a in enumerate(ra):
+            if not isinstance(a, dict) or not is_str(a.get("sig")) or not is_str(a.get("pointer")):
+                errs.append(e("V5", ln, "red_attempts[%d] 缺非空 sig/pointer" % i))
+
+    acc = r.get("acceptance")
+    if isinstance(acc, list):
+        spec = MATRIX["acceptance_element"]
+        mn = 0 if tier == "lite" else 1
+        if len(acc) < mn:
+            errs.append(e("V6", ln, "acceptance 长度 %d < %d" % (len(acc), mn)))
+        ids = []
+        for i, a in enumerate(acc):
+            if not isinstance(a, dict):
+                errs.append(e("V6", ln, "acceptance[%d] 不是对象" % i)); continue
+            for k, ks in spec.items():
+                if ks.get("req") and not is_str(a.get(k)):
+                    errs.append(e("V6", ln, "acceptance[%d].%s 缺或为空" % (i, k)))
+                if k == "verdict" and a.get(k) not in ks["enum"]:
+                    errs.append(e("V6", ln, "落盘 verdict 只允许 PENDING/UNKNOWN，实为 %r" % (a.get(k),)))
+                    errs.append(e("V12", ln, "验收结论只能由 accept 事件折叠，模型不得写死 PASS/FAIL"))
+            if is_str(a.get("id")):
+                if a["id"] in ids:
+                    errs.append(e("V6", ln, "acceptance id 重复: %s" % a["id"]))
+                ids.append(a["id"])
+            for k in ("criterion", "pointer"):
+                if isinstance(a.get(k), str):
+                    errs += freetext("acceptance." + k, a[k], ln)
+
+    if r.get("arbiter") == "none" and not is_str(r.get("arbiter_reason")):
+        errs.append(e("V7", ln, "arbiter=none 需要非空 arbiter_reason"))
+    if r.get("arbiter") != "none" and is_str(r.get("arbiter_reason")):
+        errs.append(e("V7", ln, "非 none 的 arbiter 不得带 arbiter_reason"))
+    if r.get("degraded") is True and not is_str(r.get("degraded_recovery")):
+        errs.append(e("V8", ln, "degraded=true 需要非空 degraded_recovery"))
+    if r.get("degraded") is not True and is_str(r.get("degraded_recovery")):
+        errs.append(e("V8", ln, "非 degraded 不得带 degraded_recovery"))
+    return errs
+
+
+def check_gate(r, ln):
+    errs, spec = [], MATRIX["gate_record"]
+    for k in spec["required"]:
+        if k not in r:
+            errs.append(e("V2", ln, "gate 缺 %s" % k))
+    prof = r.get("profile")
+    if prof not in spec["profile_stages"]:
+        errs.append(e("V3", ln, "gate.profile 不在枚举: %r" % prof))
+    st = r.get("stages")
+    if isinstance(st, dict) and prof in spec["profile_stages"]:
+        for k in spec["profile_stages"][prof]:
+            if k not in st:
+                errs.append(e("V2", ln, "profile=%s 缺阶段 stage:%s" % (prof, k)))
+        for k in spec["forbidden_stages"].get(prof, []):
+            if k in st:
+                errs.append(e("V2", ln, "profile=%s 不得出现阶段 stage:%s" % (prof, k)))
+        for k, v in st.items():
+            if not isinstance(v, dict):
+                errs.append(e("V2", ln, "stages[stage:%s] 必须是对象" % k)); continue
+            if v.get("timed_out") is True and v.get("exit_code") == 0:
+                errs.append(e("V12", ln, "stage:%s timed_out 但 exit_code=0" % k))
+    ma = r.get("metrics_auto")
+    if isinstance(ma, dict):
+        for k in spec["metrics_auto_required"]:
+            if k not in ma:
+                errs.append(e("V9", ln, "metrics_auto 缺 %s" % k))
+        if ma.get("source") != "auto":
+            errs.append(e("V9", ln, 'metrics_auto.source 必须是 "auto": %r' % ma.get("source")))
+    if r.get("result") not in spec["result_enum"]:
+        errs.append(e("V3", ln, "gate.result 不在枚举: %r" % r.get("result")))
+    if isinstance(st, dict) and prof in spec["profile_stages"] and r.get("result") in spec["result_enum"]:
+        bad = any(not isinstance(st.get(k), dict) or st[k].get("exit_code") != 0 or st[k].get("timed_out")
+                  for k in spec["profile_stages"][prof])
+        if r["result"] == "PASS" and bad:
+            errs.append(e("V12", ln, "result=PASS 但并非所有必须阶段 exit_code=0 且未超时"))
+        if r["result"] == "FAIL" and not bad:
+            errs.append(e("V12", ln, "result=FAIL 但所有必须阶段都为 0 且未超时"))
+    return errs
+
+
+def check_schema(r, ln):
+    errs = []
+    for k, typ in (("record_type", str), ("session_id", str), ("seq", int), ("ts", str),
+                   ("spec", str), ("freezes_seq_lte", int)):
+        if k not in r:
+            errs.append(e("V2", ln, "schema 缺 %s" % k))
+        elif typ is int and not (isinstance(r[k], int) and not isinstance(r[k], bool)):
+            errs.append(e("V2", ln, "schema.%s 必须是整数" % k))
+    if r.get("spec") != "1.2":
+        errs.append(e("V3", ln, "schema.spec 必须为 \"1.2\": %r" % (r.get("spec"),)))
+    fz = r.get("freezes_seq_lte")
+    if isinstance(fz, int) and fz < 0:
+        errs.append(e("V4", ln, "freezes_seq_lte 必须 ≥ 0"))
+    return errs
+
+
+def check_accept(r, ln, tasks):
+    errs, spec = [], MATRIX["accept_record"]
+    for k in spec["required"]:
+        if k not in r:
+            errs.append(e("V2", ln, "accept 缺 %s" % k))
+    if r.get("verdict") not in spec["verdict_enum"]:
+        errs.append(e("V3", ln, "accept.verdict 不在枚举: %r" % r.get("verdict")))
+    for k in ("pointer", "note"):
+        if is_str(r.get(k)):
+            errs += freetext("accept." + k, r[k], ln)
+    tgt = r.get("target")
+    if isinstance(tgt, dict):
+        key = (tgt.get("session_id"), tgt.get("seq"))
+        t = tasks.get(key)
+        if t is None:
+            errs.append(e("V4", ln, "accept.target 指向不存在的 task: %r" % (key,)))
+        else:
+            if is_str(tgt.get("criterion_id")):
+                ids = [a.get("id") for a in (t.get("acceptance") or []) if isinstance(a, dict)]
+                if tgt["criterion_id"] not in ids:
+                    errs.append(e("V4", ln, "criterion_id 不在目标 acceptance: %s" % tgt["criterion_id"]))
+            if is_str(r.get("reviewer")) and r.get("reviewer") == t.get("executor_id"):
+                errs.append(e("V10", ln, "reviewer 与目标 executor_id 相同（自己审自己）"))
+    return errs
+
+
+def fold(tasks):
+    errs = {}
+    def resolve(t, seen):
+        c = t.get("corrects")
+        if not isinstance(c, dict):
+            return t, None
+        key = (c.get("session_id") or t.get("session_id"), c.get("seq"))
+        if key in seen:
+            return None, e("V10", 0, "corrects 链出现环: %r" % (key,))
+        if key not in tasks:
+            return None, e("V4", 0, "corrects 指向不存在的行: %r" % (key,))
+        seen.add(key)
+        return resolve(tasks[key], seen)
+    out = {}
+    for key, t in tasks.items():
+        ok, err = resolve(t, {key})
+        if err:
+            errs[key] = err
+            continue
+        out[key] = ok
+    return out, list(errs.values())
+
+
+def read_model(tasks, gates, accepts, legacy_keys):
+    eff, _ = fold(tasks)
+    def eff_key(key):
+        seen = set()
+        while True:
+            t = tasks.get(key)
+            if t is None or not isinstance(t.get("corrects"), dict):
+                return key
+            c = t["corrects"]
+            key = (c.get("session_id") or key[0], c.get("seq"))
+            if key in seen:
+                return key
+            seen.add(key)
+    latest_gate = {}
+    for g in gates:
+        k = (g.get("session_id"), g.get("target_seq"))
+        cur = latest_gate.get(k)
+        if cur is None or (g.get("ts"), g.get("seq")) > (cur.get("ts"), cur.get("seq")):
+            latest_gate[k] = g
+    events = {}
+    for a in accepts:
+        tgt = a.get("target") or {}
+        events.setdefault((tgt.get("session_id"), tgt.get("seq")), []).append(a)
+    out = []
+    for key, t in tasks.items():
+        if key in legacy_keys or t.get("corrects"):
+            continue
+        ek = eff_key(key)
+        vmap = {}
+        for a in t.get("acceptance") or []:
+            if isinstance(a, dict) and isinstance(a.get("id"), str):
+                vmap[a["id"]] = a.get("verdict")
+        evs = sorted(events.get(key, []) + events.get(ek, []),
+                     key=lambda a: (a.get("ts") or "", a.get("seq") or 0))
+        whole = [a for a in evs if not (a.get("target") or {}).get("criterion_id")]
+        per = {}
+        for a in evs:
+            cid = (a.get("target") or {}).get("criterion_id")
+            if cid:
+                per[cid] = a.get("verdict")
+        for cid in list(vmap):
+            if cid in per:
+                vmap[cid] = per[cid]
+            elif whole:
+                vmap[cid] = whole[-1].get("verdict")
+        g = latest_gate.get(key) or latest_gate.get(ek)
+        delivered = bool(g and g.get("result") == "PASS")
+        if vmap:
+            all_pass = all(v == "PASS" for v in vmap.values())
+        else:                      # 没有分项时只看整单事件；从未签收 = 未通过
+            all_pass = bool(whole) and whole[-1].get("verdict") == "PASS"
+        accepted = delivered and all_pass
+        state = "accepted" if accepted else "open"
+        out.append({"session_id": key[0], "seq": key[1], "tier": t.get("tier"),
+                    "delivered": delivered, "accepted": accepted, "state": state, "verdicts": vmap})
+    return out
+
+
+def load(path):
+    rows = []
+    for ln, line in enumerate(pathlib.Path(path).read_text(encoding="utf-8").split("\n"), 1):
+        if line.strip():
+            rows.append((ln, json.loads(line)))
+    return rows
+
+
+def main(argv):
+    if MATRIX is None:
+        print("找不到 docs/v12-field-matrix.json", file=sys.stderr); return 2
+    path = os.path.expanduser("~/.dsh/task-log.jsonl")
+    as_json = show_fold = False
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--file":
+            i += 1; path = argv[i]
+        elif a == "--json":
+            as_json = True
+        elif a == "--fold":
+            show_fold = True
+        else:
+            print("用法: schema-v12 [--file PATH] [--json] [--fold]", file=sys.stderr); return 2
+        i += 1
+    try:
+        rows = load(path)
+    except Exception as ex:
+        print("读取失败: %s" % ex, file=sys.stderr); return 2
+
+    errs = []
+    # ---- 先找 §8 切割点（分片 = 文件，一个文件只准一条） ----
+    schemas = [(idx, ln, r) for idx, (ln, r) in enumerate(rows)
+               if isinstance(r, dict) and r.get("record_type") == "schema"]
+    freezes = None
+    if schemas:
+        if len(schemas) > 1:
+            errs.append(e("V4", schemas[1][1], "一个分片只允许一条 spec=1.2 的 schema 事件"))
+        idx, ln, r = schemas[0]
+        errs += check_schema(r, ln)
+        fz = r.get("freezes_seq_lte")
+        prev_max = 0
+        for _i2, r2 in rows[:idx]:
+            if isinstance(r2, dict):
+                s2 = r2.get("seq")
+                if isinstance(s2, int) and not isinstance(s2, bool):
+                    prev_max = max(prev_max, s2)
+        if isinstance(fz, int) and fz != prev_max:
+            errs.append(e("V4", ln, "freezes_seq_lte 应为 %d 实为 %d" % (prev_max, fz)))
+        freezes = fz if isinstance(fz, int) else prev_max
+
+    # ---- V1 与分类 ----
+    tasks, gates, accepts = {}, [], []
+    legacy_keys = set()
+    # 分片 = 文件：seq 按文件顺序严格 +1，ts 单调不减（v1.1 老行没有 session_id 也照样查）
+    seen_seq, last_ts = 0, None
+    for idx, (ln, r) in enumerate(rows):
+        if not isinstance(r, dict):
+            errs.append(e("V0", ln, "不是 JSON 对象")); continue
+        sid = r.get("session_id") or "?"
+        seq = r.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            if seq != seen_seq + 1:
+                errs.append(e("V1", ln, "seq 应为 %d 实为 %r" % (seen_seq + 1, seq)))
+            seen_seq = seq
+        ts = r.get("ts")
+        if isinstance(ts, str):
+            if last_ts is not None and ts < last_ts:
+                errs.append(e("V1", ln, "ts 倒退: %s < %s" % (ts, last_ts)))
+            last_ts = ts
+
+        if freezes is not None and isinstance(seq, int) and seq <= freezes:
+            if r.get("record_type") not in (None, "task"):
+                errs.append(e("V2", ln, "切割点之前的行不应是 %r" % r.get("record_type")))
+            legacy_keys.add((sid, seq))
+            continue  # legacy 只受 V1 约束
+
+        rt = r.get("record_type")
+        if rt is None:
+            if r.get("legacy") is True:      # 无切割事件的老分片：兼容读取
+                tasks[(sid, seq)] = r
+                continue
+            errs.append(e("V2", ln, "缺 record_type（v1.2 行必须显式写）"))
+            continue
+        if rt == "task":
+            tasks[(sid, seq)] = r
+        elif rt == "gate":
+            gates.append(r)
+        elif rt == "accept":
+            accepts.append(r)
+        elif rt == "schema":
+            if r.get("spec") != "1.2":
+                pass  # 已在 check_schema 报 V3
+        else:
+            errs.append(e("V3", ln, "未知 record_type: %r" % rt))
+
+    # ---- 业务规则 ----
+    line_of = {}
+    for idx, (ln, r) in enumerate(rows):
+        if isinstance(r, dict):
+            line_of[id(r)] = ln
+    for key, r in tasks.items():
+        if key in legacy_keys:
+            continue
+        errs += check_task(r, line_of.get(id(r), 0))
+    for r in gates:
+        ln = line_of.get(id(r), 0)
+        errs += check_gate(r, ln)
+        if isinstance(r.get("target_seq"), int) and (r.get("session_id"), r["target_seq"]) not in tasks:
+            errs.append(e("V4", ln, "gate.target_seq 指向不存在的 task"))
+    for r in accepts:
+        errs += check_accept(r, line_of.get(id(r), 0), tasks)
+
+    live = {k: v for k, v in tasks.items() if k not in legacy_keys}
+    _eff, ferrs = fold(live)
+    errs += ferrs
+
+    if show_fold:
+        model = read_model(tasks, gates, accepts, legacy_keys)
+        for m in model:
+            vs = ",".join("%s=%s" % (k, v) for k, v in (m["verdicts"] or {}).items()) or "-"
+            print("%s#%s %-4s %-8s %s" % (m["session_id"], m["seq"], m["tier"] or "?", m["state"], vs))
+        cnt = {}
+        for m in model:
+            cnt[m["state"]] = cnt.get(m["state"], 0) + 1
+        print("读模型:", cnt, "｜legacy(只查 V1):", len(legacy_keys))
+        return 0 if not errs else 1
+
+    if as_json:
+        print(json.dumps({"errors": errs, "rows": len(rows), "tasks": len(tasks),
+                          "gates": len(gates), "accepts": len(accepts),
+                          "schema_events": len(schemas),
+                          "legacy": len(legacy_keys)}, ensure_ascii=False, indent=1))
+        return 1 if errs else 0
+
+    for x in errs[:80]:
+        print("%s%s  %s" % (x["code"], ("行%d" % x["line"]) if x["line"] else "", x["msg"]))
+    if len(errs) > 80:
+        print("… 还有 %d 条" % (len(errs) - 80))
+    print("V12: %s（行 %d / task %d / gate %d / accept %d / legacy %d，错 %d）"
+          % ("FAIL" if errs else "PASS", len(rows), len(tasks), len(gates), len(accepts),
+             len(legacy_keys), len(errs)))
+    return 1 if errs else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

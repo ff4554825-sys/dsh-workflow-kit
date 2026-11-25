@@ -7,15 +7,22 @@ set -u
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 2
 fail=0
 
-echo "=== 1/2 log-check 判死测试（pytest） ==="
+echo "=== 1/3 log-check 判死测试（pytest） ==="
 if PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider "$HERE/verify/logcheck"; then
   :
 else
   fail=1
 fi
 
-echo "=== 2/2 gate 行为场景 ==="
+echo "=== 2/3 gate 行为场景 ==="
 if sh "$HERE/verify/gate/test_gate.sh"; then
+  :
+else
+  fail=1
+fi
+
+echo "=== 3/3 v1.2 字段矩阵必红样例 ==="
+if PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider "$HERE/verify/v12"; then
   :
 else
   fail=1

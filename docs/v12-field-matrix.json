@@ -1,0 +1,330 @@
+{
+  "version": "1.2",
+  "task_fields": {
+    "record_type": {
+      "type": "string",
+      "write": "Auto",
+      "lite": "REQ",
+      "std": "REQ",
+      "full": "REQ",
+      "const": "task"
+    },
+    "session_id": {
+      "type": "string",
+      "write": "Auto",
+      "lite": "REQ",
+      "std": "REQ",
+      "full": "REQ"
+    },
+    "seq": {
+      "type": "int",
+      "write": "Auto",
+      "lite": "REQ",
+      "std": "REQ",
+      "full": "REQ"
+    },
+    "ts": {
+      "type": "string",
+      "write": "Auto",
+      "lite": "REQ",
+      "std": "REQ",
+      "full": "REQ"
+    },
+    "executor_id": {
+      "type": "string",
+      "write": "Auto",
+      "lite": "REQ",
+      "std": "REQ",
+      "full": "REQ"
+    },
+    "task": {
+      "type": "string",
+      "write": "Model",
+      "lite": "REQ",
+      "std": "REQ",
+      "full": "REQ"
+    },
+    "tier": {
+      "type": "string",
+      "write": "Auto|Model",
+      "lite": "REQ",
+      "std": "REQ",
+      "full": "REQ",
+      "enum": [
+        "lite",
+        "std",
+        "full"
+      ]
+    },
+    "tier_rule": {
+      "type": "string",
+      "write": "Auto",
+      "lite": "OPT",
+      "std": "REQ",
+      "full": "REQ"
+    },
+    "status": {
+      "type": "string",
+      "write": "Model",
+      "lite": "REQ",
+      "std": "REQ",
+      "full": "REQ",
+      "enum": [
+        "done",
+        "partial",
+        "blocked"
+      ]
+    },
+    "evidence": {
+      "type": "string",
+      "write": "Model",
+      "lite": "REQ",
+      "std": "REQ",
+      "full": "REQ",
+      "freetext": true
+    },
+    "corrects": {
+      "type": "object|null",
+      "write": "Model",
+      "lite": "OPT",
+      "std": "OPT",
+      "full": "OPT"
+    },
+    "arbiter": {
+      "type": "string",
+      "write": "Auto|Model",
+      "lite": "OPT",
+      "std": "REQ",
+      "full": "REQ"
+    },
+    "arbiter_reason": {
+      "type": "string|null",
+      "write": "Model",
+      "lite": "COND",
+      "std": "COND",
+      "full": "COND",
+      "cond": "arbiter==none",
+      "freetext": true
+    },
+    "degraded": {
+      "type": "boolean",
+      "write": "Auto|Model",
+      "lite": "OPT",
+      "std": "REQ",
+      "full": "REQ"
+    },
+    "degraded_recovery": {
+      "type": "string|null",
+      "write": "Model",
+      "lite": "COND",
+      "std": "COND",
+      "full": "COND",
+      "cond": "degraded==true",
+      "freetext": true
+    },
+    "kill_action": {
+      "type": "object|null",
+      "write": "Model",
+      "lite": "OPT",
+      "std": "OPT",
+      "full": "REQ"
+    },
+    "red_attempts": {
+      "type": "array",
+      "write": "Model",
+      "lite": "COND",
+      "std": "COND",
+      "full": "COND",
+      "empty_array": "never"
+    },
+    "acceptance": {
+      "type": "array",
+      "write": "Model",
+      "lite": "OPT",
+      "std": "REQ",
+      "full": "REQ",
+      "empty_array": "lite-only",
+      "min_len": {
+        "lite": 0,
+        "std": 1,
+        "full": 1
+      }
+    },
+    "review": {
+      "type": "string",
+      "write": "Model",
+      "lite": "FORBID",
+      "std": "REQ",
+      "full": "REQ",
+      "freetext": true
+    },
+    "improve": {
+      "type": "object|null",
+      "write": "Model",
+      "lite": "FORBID",
+      "std": "OPT",
+      "full": "REQ"
+    },
+    "carryover": {
+      "type": "array",
+      "write": "Auto|Model",
+      "lite": "FORBID",
+      "std": "OPT",
+      "full": "REQ",
+      "empty_array": "allow"
+    },
+    "legacy": {
+      "type": "boolean",
+      "write": "Auto",
+      "lite": "FORBID",
+      "std": "FORBID",
+      "full": "FORBID"
+    }
+  },
+  "acceptance_element": {
+    "id": {
+      "type": "string",
+      "req": true
+    },
+    "criterion": {
+      "type": "string",
+      "req": true,
+      "freetext": true
+    },
+    "verdict": {
+      "type": "string",
+      "req": true,
+      "enum": [
+        "PENDING",
+        "UNKNOWN"
+      ]
+    },
+    "pointer": {
+      "type": "string",
+      "req": true,
+      "freetext": true
+    }
+  },
+  "improve_object": {
+    "id": {
+      "type": "string",
+      "req": true
+    },
+    "window": {
+      "type": "int",
+      "req": true,
+      "min": 1
+    },
+    "finding": {
+      "type": "string",
+      "req": true,
+      "freetext": true
+    },
+    "severity": {
+      "type": "string",
+      "req": true,
+      "enum": [
+        "P0",
+        "P1",
+        "P2"
+      ]
+    },
+    "action": {
+      "type": "string",
+      "req": true,
+      "freetext": true
+    },
+    "due": {
+      "type": "string",
+      "req": true
+    },
+    "restore": {
+      "type": "string",
+      "req": true,
+      "freetext": true
+    },
+    "closed": {
+      "type": "boolean",
+      "req": true,
+      "const": false
+    }
+  },
+  "gate_record": {
+    "required": [
+      "record_type",
+      "session_id",
+      "seq",
+      "target_seq",
+      "ts",
+      "profile",
+      "stages",
+      "metrics_auto",
+      "result"
+    ],
+    "profile_stages": {
+      "lite": [
+        "S"
+      ],
+      "code": [
+        "S",
+        "F1",
+        "F2",
+        "F3"
+      ],
+      "doc": [
+        "S",
+        "F1",
+        "F2",
+        "F3"
+      ]
+    },
+    "forbidden_stages": {
+      "lite": [
+        "F1",
+        "F2",
+        "F3"
+      ]
+    },
+    "metrics_auto_required": [
+      "rounds",
+      "red",
+      "tool_calls",
+      "aborted",
+      "source"
+    ],
+    "result_enum": [
+      "PASS",
+      "FAIL"
+    ]
+  },
+  "accept_record": {
+    "required": [
+      "record_type",
+      "session_id",
+      "seq",
+      "target",
+      "ts",
+      "reviewer",
+      "verdict",
+      "pointer"
+    ],
+    "verdict_enum": [
+      "PASS",
+      "FAIL",
+      "UNKNOWN"
+    ]
+  },
+  "freetext_keys": [
+    "evidence",
+    "review",
+    "note",
+    "pointer",
+    "criterion",
+    "arbiter_reason",
+    "degraded_recovery",
+    "finding",
+    "action",
+    "restore"
+  ],
+  "freetext_max": 2048
+}

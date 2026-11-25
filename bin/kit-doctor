@@ -45,7 +45,7 @@ for f in "$repo"/bin/*; do
   fi
 done
 
-for rel in verify/logcheck/test_logcheck.py verify/gate/test_gate.sh; do
+for rel in docs/v12-field-matrix.json verify/logcheck/test_logcheck.py verify/gate/test_gate.sh; do
   f="$repo/$rel"
   [ -f "$f" ] || continue
   total=$((total + 1))

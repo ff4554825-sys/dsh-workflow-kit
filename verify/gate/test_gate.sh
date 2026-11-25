@@ -21,6 +21,10 @@ chmod +x "$DSH_HOME"/bin/* 2>/dev/null || true
 for d in logcheck gate; do
   cp -r "$ROOT/verify/$d" "$DSH_HOME/verify/$d" || exit 2
 done
+# schema-v12 依赖字段矩阵；不拷这份，kit-doctor 会一直报 MISSING
+mkdir -p "$DSH_HOME/docs"
+cp "$ROOT/docs/v12-field-matrix.json" "$DSH_HOME/docs/" || exit 2
+
 GATE="$DSH_HOME/bin/gate"
 GLOG="$DSH_HOME/verify/gate-log.jsonl"
 

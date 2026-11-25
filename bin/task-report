@@ -15,16 +15,22 @@ try{rows=fs.readFileSync(LOG,"utf8").split("\n").filter(Boolean).map(l=>{try{ret
 const tsOf=r=>r.ts||r.at||"";
 if(days>0){const cut=Date.now()-days*86400000; rows=rows.filter(r=>{const t=new Date(tsOf(r)).getTime(); return !isNaN(t)&&t>=cut;});}
 if(!rows.length){console.log("没有记录");process.exit(0)}
+// §8 切割：有 schema 事件就两套口径分开，不相加
+const cutRow=rows.find(r=>r&&r.record_type==="schema");
+let legacyRows=rows, modernRows=[];
+if(cutRow){const fz=cutRow.freezes_seq_lte|0;
+  legacyRows=rows.filter(r=>typeof r.seq==="number"&&r.seq<=fz);
+  modernRows=rows.filter(r=>!(typeof r.seq==="number"&&r.seq<=fz));}
 const bucket=r=>{const s=(r.status!==undefined?r.status:r.result);
   if(s==="done"||s==="success")return "success";
   if(s==="blocked"||s==="fail")return "fail";
   if(s==="partial")return "partial";
   return "unknown";};
-const n=rows.length, c={success:0,partial:0,fail:0,unknown:0};
+const n=legacyRows.length, c={success:0,partial:0,fail:0,unknown:0};
 const tools={}, lessons={}, fails=[];
 const verdicts={PASS:0,FAIL:0,UNKNOWN:0};
 let red=0, degraded=0, v10=0;
-rows.forEach(r=>{
+legacyRows.forEach(r=>{
   c[bucket(r)]++;
   if(r.status!==undefined)v10++;
   if(r.degraded===true)degraded++;
@@ -39,8 +45,35 @@ const pct=x=>n?Math.round(x/n*100):0;
 const L=[];
 L.push("# 任务总结报告","");
 L.push(`- 生成时间：${new Date().toLocaleString("sv-SE",{timeZone:"Asia/Shanghai"})}`);
-L.push(`- 统计范围：${days>0?"最近 "+days+" 天":"全部记录"}（${n} 个任务；v1.0 schema ${v10} 条 / legacy ${n-v10} 条）`);
+L.push(`- 统计范围：${days>0?"最近 "+days+" 天":"全部记录"}（legacy/自评集 ${n} 条；v1.0 schema ${v10} 条）`);
 L.push("");
+if(cutRow){
+  const tasks=new Map(),gates=new Map(),acc=[];
+  modernRows.forEach(r=>{
+    if(r.record_type==="task")tasks.set(r.seq,r);
+    else if(r.record_type==="gate"){const k=r.target_seq,cur=gates.get(k);
+      if(!cur||(r.ts||"")>(cur.ts||"")||((r.ts||"")===(cur.ts||"")&&r.seq>cur.seq))gates.set(k,r);}
+    else if(r.record_type==="accept")acc.push(r);
+  });
+  let delivered=0,accepted=0,open=0;
+  tasks.forEach((t,seq)=>{
+    const vmap={};(t.acceptance||[]).forEach(a=>{if(a&&a.id)vmap[a.id]=a.verdict||"PENDING"});
+    const evs=acc.filter(a=>a.target&&a.target.seq===seq);
+    const whole=evs.filter(a=>!(a.target.criterion_id));
+    evs.forEach(a=>{if(a.target.criterion_id&&vmap[a.target.criterion_id]!==undefined)vmap[a.target.criterion_id]=a.verdict});
+    if(whole.length)Object.keys(vmap).forEach(k=>{if(!evs.some(a=>a.target.criterion_id===k))vmap[k]=whole[whole.length-1].verdict});
+    const g=gates.get(seq), d=!!(g&&g.result==="PASS"), vals=Object.values(vmap);
+    if(d)delivered++;
+    const ok=d&&(vals.length>0?vals.every(v=>v==="PASS")
+                 :(whole.length>0&&whole[whole.length-1].verdict==="PASS"));
+    if(ok)accepted++;else open++;
+  });
+  L.push("## v1.2 分片（切割点之后）","");
+  L.push(`- legacy ${legacyRows.length} 行（seq≤${cutRow.freezes_seq_lte}，只计旧 S1，自评口径见下表）`);
+  L.push(`- v1.2：task ${tasks.size} / gate ${gates.size} / accept ${acc.length} → delivered ${delivered} / accepted ${accepted} / open ${open}`);
+  L.push("- 两套口径分开，不相加；`accepted` 只认外部 accept 事件折叠出的全 PASS");
+  L.push("");
+}
 L.push("## 成功率","| 结果 | 数量 | 占比 |","|---|---|---|");
 L.push(`| ✅ 成功 | ${c.success} | ${pct(c.success)}% |`);
 L.push(`| ⚠️ 部分达成 | ${c.partial} | ${pct(c.partial)}% |`);

@@ -13,6 +13,9 @@ mkdir -p "$DSH_HOME/bin" "$DSH_HOME/verify"
 # shellcheck disable=SC2086
 install -m 755 "$HERE"/bin/* "$DSH_HOME/bin/"
 
+mkdir -p "$DSH_HOME/docs"
+install -m 644 "$HERE"/docs/v12-field-matrix.json "$DSH_HOME/docs/" 2>/dev/null || true
+
 for d in logcheck gate cancel; do
   [ -d "$HERE/verify/$d" ] || continue
   rm -rf "$DSH_HOME/verify/$d"

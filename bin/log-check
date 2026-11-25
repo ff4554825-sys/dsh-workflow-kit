@@ -146,7 +146,16 @@ def main():
     if not p.exists():
         print("S0 文件不存在: %s" % p)
         sys.exit(1)
-    errs = check_text(p.read_text(encoding="utf-8"))
+    text = p.read_text(encoding="utf-8")
+    # v1.2 切割：文件里出现 schema 事件后，本文件由 schema-v12 接管（V 编号）。
+    # 唯一开关，不再维护第二套分派逻辑。
+    if any('"record_type"' in ln and '"schema"' in ln for ln in text.split("\n")):
+        sibling = pathlib.Path(os.path.realpath(__file__)).parent / "schema-v12"
+        if not sibling.exists():
+            print("S0 发现 schema 事件，但 schema-v12 未安装（缺工具=不通过）")
+            sys.exit(1)
+        os.execv(sys.executable, [sys.executable, str(sibling), "--file", str(p)])
+    errs = check_text(text)
     for code, seq, msg in errs:
         print("%s seq=%s %s" % (code, seq, msg))
     print("SCHEMA: FAIL" if errs else "SCHEMA: OK")

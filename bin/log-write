@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""log-write — v1.2 落盘脚手架（§4 补全规则的最小实现）
+
+用法:
+  log-write --lite --task "一句话" --status done --evidence "证据" [--gate PASS|FAIL] [--file PATH]
+  log-write --json '{"tier":"std", ...}'                    # 手写整行，Auto 字段仍由本脚本补
+  log-write --cut [--file PATH]                              # 追加 §8 切割事件（一次性）
+
+规矩:
+  * Auto 字段（record_type/session_id/seq/ts/executor_id）只由本脚本写；模型传了也以脚本为准。
+  * 先校验后落盘：整文件拼一份临时副本跑 schema-v12，红就不写，退出码 1。
+  * 只追加；不修改任何已有行。
+退出码: 0 已写入 / 1 校验失败未写入 / 2 用法错误
+"""
+import json, os, pathlib, subprocess, sys, tempfile, datetime
+
+HOME = pathlib.Path(os.environ.get("DSH_HOME", pathlib.Path.home() / ".dsh"))
+BIN = HOME / "bin"
+TARGET = HOME / "task-log.jsonl"
+EXECUTOR = os.environ.get("DSH_EXECUTOR", "model:lead")
+SESSION = os.environ.get("DSH_SHARD", "local")
+
+
+def now():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def read_rows(path):
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").split("\n") if l.strip()]
+
+
+def stamp(rows):
+    """ts 必须单调不减：手改过未来时间戳时，顺延到上一条 +1 秒。"""
+    t = datetime.datetime.now().astimezone()
+    last = rows[-1].get("ts") if rows else None
+    if isinstance(last, str):
+        try:
+            lt = datetime.datetime.fromisoformat(last)
+            if t <= lt:
+                t = lt + datetime.timedelta(seconds=1)
+        except ValueError:
+            pass
+    return t.isoformat(timespec="seconds")
+
+
+def next_seq(rows):
+    return max((r.get("seq") for r in rows if isinstance(r.get("seq"), int)), default=0) + 1
+
+
+def validate(path, rows_new):
+    """把现有行 + 新行写成临时文件，交给 schema-v12；返回 (ok, 输出)。"""
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8") as f:
+        f.write(existing)
+        for r in rows_new:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        tmp = f.name
+    try:
+        v12 = BIN / "schema-v12"
+        if not v12.exists():
+            return False, "schema-v12 未安装（缺工具=不通过）"
+        out = subprocess.run([sys.executable, str(v12), "--file", tmp],
+                             capture_output=True, text=True)
+        return out.returncode == 0, (out.stdout + out.stderr).strip()
+    finally:
+        os.unlink(tmp)
+
+
+def append(path, rows):
+    with open(path, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def auto_fields(row, seq):
+    row["record_type"] = row.get("record_type") or "task"
+    row["session_id"] = SESSION
+    row["seq"] = seq
+    row["ts"] = row.get("ts") or now()
+    row["executor_id"] = EXECUTOR
+    return row
+
+
+def main(argv):
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr); return 2
+    path = TARGET
+    args = list(argv)
+    if "--file" in args:
+        i = args.index("--file"); path = pathlib.Path(args[i + 1]); del args[i:i + 2]
+
+    rows = read_rows(path)
+
+    if "--cut" in args:
+        fz = max((r.get("seq") for r in rows if isinstance(r.get("seq"), int)), default=0)
+        cut = {"record_type": "schema", "session_id": SESSION, "seq": next_seq(rows),
+               "ts": stamp(rows), "spec": "1.2", "freezes_seq_lte": fz}
+        ok, out = validate(path, [cut])
+        if not ok:
+            print(out); print("切割未写入（校验失败）"); return 1
+        append(path, [cut])
+        print("已追加切割事件: seq=%d freezes_seq_lte=%d" % (cut["seq"], fz))
+        return 0
+
+    if "--accept" in args:
+        def get(k, default=None):
+            return args[args.index(k) + 1] if k in args else default
+        tgt = get("--target-seq")
+        verdict = get("--verdict")
+        reviewer = get("--reviewer")
+        pointer = get("--pointer")
+        if not tgt or verdict not in ("PASS", "FAIL", "UNKNOWN") or not reviewer or not pointer:
+            print("--accept 需要 --target-seq / --verdict PASS|FAIL|UNKNOWN / --reviewer / --pointer",
+                  file=sys.stderr)
+            return 2
+        tgt_seq = int(tgt)
+        tgt_row = next((r for r in rows if r.get("seq") == tgt_seq and r.get("record_type") == "task"), None)
+        if tgt_row is None:
+            print("目标 task 不存在: seq=%d" % tgt_seq, file=sys.stderr); return 1
+        if reviewer == tgt_row.get("executor_id"):
+            print("reviewer 不能等于目标 executor_id（自己审自己）", file=sys.stderr); return 1
+        target = {"session_id": tgt_row.get("session_id", SESSION), "seq": tgt_seq}
+        if get("--criterion-id"):
+            target["criterion_id"] = get("--criterion-id")
+        row = {"record_type": "accept", "session_id": SESSION, "seq": next_seq(rows),
+               "ts": stamp(rows), "target": target, "reviewer": reviewer,
+               "verdict": verdict, "pointer": pointer}
+        if get("--note"):
+            row["note"] = get("--note")
+        ok, out = validate(path, [row])
+        if not ok:
+            print(out); print("未写入（校验失败，日志保持原样）"); return 1
+        append(path, [row])
+        print("已写入 accept seq=%d → task %d [%s]" % (row["seq"], tgt_seq, verdict))
+        return 0
+
+    if "--json" in args:
+        i = args.index("--json"); payload = json.loads(args[i + 1])
+    elif "--lite" in args:
+        def get(k, default=None):
+            return args[args.index(k) + 1] if k in args else default
+        payload = {"tier": "lite", "task": get("--task"), "status": get("--status", "done"),
+                   "evidence": get("--evidence")}
+        if not payload["task"] or not payload["evidence"]:
+            print("--lite 需要 --task 与 --evidence", file=sys.stderr); return 2
+    else:
+        print("需要 --lite 或 --json", file=sys.stderr); return 2
+
+    row = auto_fields(dict(payload), next_seq(rows))
+    row["ts"] = stamp(rows)
+    batch = [row]
+
+    gate = None
+    if "--gate" in args:
+        res = args[args.index("--gate") + 1]
+        if res not in ("PASS", "FAIL"):
+            print("--gate 只接受 PASS / FAIL", file=sys.stderr); return 2
+        gate = {"record_type": "gate", "session_id": SESSION, "seq": row["seq"] + 1,
+                "target_seq": row["seq"], "ts": row["ts"], "profile": "lite",
+                "stages": {"S": {"exit_code": 0 if res == "PASS" else 1,
+                                 "duration_ms": 0, "retries": 0, "timed_out": False}},
+                "metrics_auto": {"rounds": 0, "red": 0, "tool_calls": 0, "aborted": 0,
+                                 "source": "auto"},
+                "result": res}
+        batch.append(gate)
+
+    ok, out = validate(path, batch)
+    if not ok:
+        print(out)
+        print("未写入（校验失败，日志保持原样）")
+        return 1
+    append(path, batch)
+    print("已写入 seq=%d%s" % (row["seq"], " + gate seq=%d" % gate["seq"] if gate else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

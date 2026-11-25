@@ -151,3 +151,36 @@ sh scripts/selftest.sh
 ## License
 
 MIT
+
+## v1.2 字段矩阵（草案，可跑）
+
+v1.2 把存储拆成四种行：`task` / `gate` / `accept` / `schema`，验收结论由外部
+accept 事件折叠，模型不得在 task 行写死 `PASS`/`FAIL`。规范原文
+`docs/v1.2-field-matrix.md`，机器矩阵 `docs/v12-field-matrix.json`，校验器
+`bin/schema-v12`。
+
+规则编号一律 **V1–V13**；S1–S10 冻结给 legacy 行，不重定义、不混用。
+门禁阶段名仍是 `S`，报错写成 `stage:S`，与规则号分开。
+
+```sh
+./bin/schema-v12 --file ~/.dsh/task-log.jsonl      # V1–V13 逐行判红
+./bin/schema-v12 --file … --fold                    # 读模型：delivered/accepted/open
+
+./bin/log-write --cut                               # 追加 §8 切割事件（一次性）
+./bin/log-write --lite --task "…" --evidence "…" --gate PASS
+./bin/log-write --accept --target-seq 43 --verdict PASS \
+                --reviewer user --pointer "review://…"
+./bin/task-stats                                    # 两套口径分开报，不相加
+```
+
+必红样例在 `verify/v12`（24 条，含「模型自写 PASS」「gate 超时却 exit 0」
+「reviewer 自己审自己」「corrects 成环」「切割点写错」「两条 schema 事件」），
+已并入 `scripts/selftest.sh`。
+
+**切割**（§8）：旧行不补字段、不降级。只追加一条
+`{"record_type":"schema","spec":"1.2","freezes_seq_lte":N}`，N 必须是此前最大
+seq；`seq <= N` 的行按 legacy 只查 V1，且不进 delivered / accepted / open。
+
+**未做**：真日志还没追加这条 schema 事件。原因：`log-check`（v1.1）仍按 17 字段
+查每一行，先加 schema 行会让 S 关判红、把交付门整个堵死。切割必须与
+「S 关改读 v1.2」同批落地。
