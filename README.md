@@ -25,10 +25,16 @@ docs/              schema 规范与「工具有分发前被取消」的根因分
 examples/          一条脱敏示例日志
 ```
 
+## 远程仓库
+
+- 浏览：<https://github.com/ff4554825-sys/dsh-workflow-kit>
+- SSH：`git@github.com:ff4554825-sys/dsh-workflow-kit.git`（走 `ssh.github.com:443`）
+- 默认分支 `main`。建仓用手机上的狐猴浏览器，之后的改/删/推一律走这把 ed25519 key。
+
 ## 安装
 
 ```sh
-git clone git@github.com:<you>/dsh-workflow-kit.git
+git clone git@github.com:ff4554825-sys/dsh-workflow-kit.git
 cd dsh-workflow-kit
 install -m 755 bin/* ~/.dsh/bin/
 mkdir -p ~/.dsh/verify/logcheck && cp -r verify/logcheck/* ~/.dsh/verify/logcheck/
