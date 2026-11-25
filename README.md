@@ -21,7 +21,8 @@ bin/proc-stats     流程指标自动统计（轮次/步数/工具调用/被取�
 bin/task-stats     日志快速统计（成功率、外部判定、返工次数）
 bin/task-report    周期报告，输出 markdown 到 $DSH_HOME/reports/
 verify/logcheck/   校验器自测（pytest，10 个用例：7 个坏样例 + 1 个好样例）
-docs/              schema 规范与「工具有分发前被取消」的根因分析
+verify/cancel/     工具「分发前被取消」的取消判定回归测试（node）
+docs/              schema 规范与「工具分发前被取消」的根因分析
 examples/          一条脱敏示例日志
 ```
 
