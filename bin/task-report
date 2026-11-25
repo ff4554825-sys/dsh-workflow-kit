@@ -1,11 +1,14 @@
 #!/bin/sh
-# task-report [天数] — 周期报告（v1.0 + legacy 兼容），默认写到 $DSH_HOME/reports/
+# task-report [天数] — 周期报告（v1.0 + legacy 兼容）
+# 输出目录优先级：$TASK_REPORT_DIR → $DSH_HOME/reports-dir 文件里的一行 → $DSH_HOME/reports/
+# 本机固定的目录写进 reports-dir，别改脚本——改脚本会让安装副本和仓库副本漂移。
 DAYS="${1:-0}"
 node -e '
 const fs=require("fs"), path=require("path");
 const H=process.env.DSH_HOME||(process.env.HOME+"/.dsh");
 const LOG=H+"/task-log.jsonl";
-const OUTDIR=process.env.TASK_REPORT_DIR||(H+"/reports");
+let cfgDir=""; try{cfgDir=fs.readFileSync(H+"/reports-dir","utf8").trim()}catch(e){}
+const OUTDIR=process.env.TASK_REPORT_DIR||cfgDir||(H+"/reports");
 const days=Number(process.argv[1]||0);
 let rows=[];
 try{rows=fs.readFileSync(LOG,"utf8").split("\n").filter(Boolean).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean)}catch(e){}

@@ -1,80 +1,213 @@
 #!/bin/sh
-# gate <文件或目录...>  交付三道过滤器：F1 解析/编译  F2 测试  F3 质量指标
-fail=0
+# gate <文件或目录...>   交付门：S(schema) → F1(解析/编译) → F2(测试) → F3(质量指标)
+# gate --self-check     仓库副本与安装副本是否一致（调 kit-doctor）
+#
+# 串行短路：任一关红立刻停，后面各关不跑。最后一行固定给出 GATE: PASS / GATE: FAIL (<关>)。
+# 退出码：0 PASS / 1 FAIL / 2 用法错误
+# 记账：$DSH_HOME/verify/gate-log.jsonl（proc-stats 从这里取 gate 通过率）
+# 工具查找顺序：本脚本同目录 → $DSH_HOME/bin。同目录优先，保证仓库副本自洽；
+# 跨机安装用 scripts/install.sh，漂移用 gate --self-check 查。
+set -u
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || SELF_DIR=.
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 GLOG="$DSH_HOME/verify/gate-log.jsonl"
-log_gate() { mkdir -p "$(dirname "$GLOG")"; printf '{"ts":"%s","result":"%s","files":%s}\n' "$(date -Iseconds)" "$1" "$NFILES" >> "$GLOG"; }
-NFILES=$#
-[ $# -eq 0 ] && { echo "用法: gate <文件或目录>..."; exit 2; }
+TMP=$(mktemp -d 2>/dev/null || mktemp -d -t gate) || { echo "✗ 无法创建临时目录"; exit 2; }
+trap 'rm -rf "$TMP"' EXIT
 
-# ---------- S 系列：task-log schema 前置校验（红则不进入 F1/F2） ----------
-SFAIL=0
+tool() { # tool <名字> → 打印可用路径；找不到返回 1
+  for d in "$SELF_DIR" "$DSH_HOME/bin"; do
+    [ -x "$d/$1" ] && { printf '%s\n' "$d/$1"; return 0; }
+  done
+  return 1
+}
+
+log_gate() { # log_gate <RESULT>，files 用 NFILES
+  mkdir -p "$DSH_HOME/verify" 2>/dev/null || true
+  [ -d "$DSH_HOME/verify" ] || return 0
+  printf '{"ts":"%s","result":"%s","files":%s}\n' \
+    "$(date -Iseconds)" "$1" "${NFILES:-0}" >> "$GLOG" 2>/dev/null || true
+}
+
+usage() {
+  cat <<'EOF'
+用法: gate <文件或目录>...     交付门 S→F1→F2→F3，串行短路
+      gate --self-check       仓库副本与安装副本一致性
+退出码: 0 PASS / 1 FAIL / 2 用法错误
+EOF
+}
+
+if [ $# -eq 0 ]; then usage; exit 2; fi
+if [ "$1" = "--self-check" ]; then
+  shift
+  if DOCTOR=$(tool kit-doctor); then "$DOCTOR" "$@"; exit $?; fi
+  echo "✗ --self-check: 找不到 kit-doctor（scripts/install.sh 会装）"
+  exit 2
+fi
+
+# ---------- 阶段 1 / S：task-log schema（按内容识别，不看文件名） ----------
+s_fail=0
+LOGCHECK=$(tool log-check) || LOGCHECK=""
 for a in "$@"; do
-  case "$(basename "$a")" in
-    *task-log*.jsonl)
-      if [ -x "$DSH_HOME/bin/log-check" ]; then
-        if out=$("$DSH_HOME/bin/log-check" --file "$a" 2>&1); then
-          echo "✓ S schema PASS ($(basename "$a"))"
-        else
-          echo "✗ S $a schema 校验失败"
-          printf '%s\n' "$out" | sed 's/^/    /'
-          SFAIL=1
-        fi
-      else
-        echo "! S log-check 不存在，跳过 schema 校验"
-      fi ;;
-    *.jsonl)
-      echo "! S $a 不匹配 task-log* 命名，S 系列未校验（显式提示，非静默跳过）" ;;
+  case "$a" in
+    *.jsonl|*.json) [ -f "$a" ] || continue ;;
+    *) continue ;;
   esac
+  if [ -z "$LOGCHECK" ]; then
+    echo "✗ S log-check 未安装，schema 无法判定（缺工具=不通过）"
+    echo "    修: scripts/install.sh"
+    s_fail=1
+    continue
+  fi
+  if "$LOGCHECK" --is-task-log "$a" >/dev/null 2>&1; then
+    if out=$("$LOGCHECK" --file "$a" 2>&1); then
+      echo "✓ S schema PASS ($a)"
+    else
+      echo "✗ S schema FAIL ($a)"
+      printf '%s\n' "$out" | sed 's/^/    /'
+      s_fail=1
+    fi
+  else
+    echo "· S 跳过（内容不是 task-log 形态，按内容判定而非文件名）: $a"
+  fi
 done
-if [ "$SFAIL" -eq 1 ]; then log_gate FAIL_S; echo "GATE: FAIL (S)"; exit 1; fi
+if [ "$s_fail" -eq 1 ]; then log_gate FAIL_S; echo "GATE: FAIL (S)"; exit 1; fi
 
-# 目录展开成文件
-LIST=""
+# ---------- 展开输入：文件清单 + 目录清单 ----------
+: > "$TMP/list"
+: > "$TMP/dirs"
 for a in "$@"; do
   if [ -d "$a" ]; then
-    for g in "$a"/*; do [ -f "$g" ] && LIST="$LIST
-$g"; done
+    printf '%s\n' "$a" >> "$TMP/dirs"
+    for g in "$a"/*; do [ -f "$g" ] && printf '%s\n' "$g" >> "$TMP/list"; done
   else
-    LIST="$LIST
-$a"
+    printf '%s\n' "$a" >> "$TMP/list"
   fi
 done
+NFILES=$(wc -l < "$TMP/list" | tr -d ' ')
 
-printf '%s\n' "$LIST" | while IFS= read -r f; do
-  [ -z "$f" ] && continue
-  [ -f "$f" ] || { echo "✗ F0 $f 不存在"; echo FAIL > /tmp/gate_fail.$$; continue; }
+# ---------- 阶段 2 / F1：可解析、可编译、结构合法 ----------
+f1_fail=0
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  [ -f "$f" ] || { echo "✗ F1 $f 不存在"; f1_fail=1; continue; }
   case "$f" in
-    *.md) [ $(( $(grep -c '^```' "$f") % 2 )) -eq 0 ] || { echo "✗ F1 $f 代码围栏不成对"; echo FAIL > /tmp/gate_fail.$$; }
-          grep -q 'TODO\|FIXME\|待补\|— 略' "$f" && { echo "✗ F3 $f 残留占位符"; echo FAIL > /tmp/gate_fail.$$; } ;;
-    *.json|*.jsonl) jq -e . "$f" >/dev/null 2>&1 || { echo "✗ F1 $f JSON 非法"; echo FAIL > /tmp/gate_fail.$$; } ;;
-    *.py) python3 -m py_compile "$f" 2>/dev/null || { echo "✗ F1 $f python 语法"; echo FAIL > /tmp/gate_fail.$$; } ;;
-    *.sh) bash -n "$f" 2>/dev/null || { echo "✗ F1 $f shell 语法"; echo FAIL > /tmp/gate_fail.$$; } ;;
+    *.md)
+      n=$(grep -c '^```' "$f" 2>/dev/null || true); n=${n:-0}
+      [ $(( n % 2 )) -eq 0 ] || { echo "✗ F1 $f 代码围栏不成对（$n 行）"; f1_fail=1; } ;;
+    *.json|*.jsonl)
+      jq -e . "$f" >/dev/null 2>&1 || { echo "✗ F1 $f JSON 非法"; f1_fail=1; } ;;
+    *.py)
+      python3 -c 'import sys;compile(open(sys.argv[1],encoding="utf-8").read(),sys.argv[1],"exec")' "$f" 2>/dev/null \
+        || { echo "✗ F1 $f python 语法"; f1_fail=1; } ;;
+    *.sh)
+      bash -n "$f" 2>/dev/null || { echo "✗ F1 $f shell 语法"; f1_fail=1; } ;;
+    *.mjs|*.js|*.cjs)
+      if command -v node >/dev/null 2>&1; then
+        node --check "$f" >/dev/null 2>&1 || { echo "✗ F1 $f node 语法"; f1_fail=1; }
+      else
+        echo "✗ F1 $f 没装 node，无法判定语法（不能判定≠通过）"; f1_fail=1
+      fi ;;
     *.v)
       case "$(basename "$f")" in
-        tb*) : ;;  # 测试台单独编译必失败（缺模块），交由 F2 整体编译
-        *) command -v iverilog >/dev/null && { iverilog -g2012 -o /dev/null "$f" 2>/dev/null || { echo "✗ F1 $f verilog 编译"; echo FAIL > /tmp/gate_fail.$$; }; } ;;
+        tb*) : ;;   # 测试台单独编译必失败（缺模块），留给 F2 整体编译
+        *)
+          if command -v iverilog >/dev/null 2>&1; then
+            iverilog -g2012 -o /dev/null "$f" 2>/dev/null || { echo "✗ F1 $f verilog 编译"; f1_fail=1; }
+          else
+            echo "✗ F1 $f 没装 iverilog，无法判定编译（不能判定≠通过）"; f1_fail=1
+          fi ;;
+      esac ;;
+    *)
+      # 无扩展名的可执行脚本：按 shebang 判语法（bin/gate 这类就靠这条）
+      first=$(head -n1 "$f" 2>/dev/null || true)
+      case "$first" in
+        '#!'*python*)
+          python3 -c 'import sys;compile(open(sys.argv[1],encoding="utf-8").read(),sys.argv[1],"exec")' "$f" 2>/dev/null \
+            || { echo "✗ F1 $f (shebang python) 语法"; f1_fail=1; } ;;
+        '#!'*node*)
+          if command -v node >/dev/null 2>&1; then
+            node --check "$f" >/dev/null 2>&1 || { echo "✗ F1 $f (shebang node) 语法"; f1_fail=1; }
+          else
+            echo "✗ F1 $f 没装 node，无法判定语法（不能判定≠通过）"; f1_fail=1
+          fi ;;
+        '#!'*sh)
+          bash -n "$f" 2>/dev/null || { echo "✗ F1 $f (shebang sh) 语法"; f1_fail=1; } ;;
       esac ;;
   esac
-done
-[ -f /tmp/gate_fail.$$ ] && fail=1; rm -f /tmp/gate_fail.$$
+done < "$TMP/list"
+if [ "$f1_fail" -eq 1 ]; then
+  log_gate FAIL_F1; echo "GATE: FAIL (F1)"; exit 1
+fi
+echo "✓ F1 $NFILES 个文件语法/结构通过"
 
-# F2 测试：按目录整体编译仿真 / 跑 pytest
-for d in $(printf '%s\n' "$LIST" | xargs -n1 dirname 2>/dev/null | sort -u); do
+# ---------- 阶段 3 / F2：按目录整体编译与跑测试 ----------
+f2_fail=0
+f2_ran=0
+while IFS= read -r d; do
   [ -d "$d" ] || continue
-  if ls "$d"/tb*.v >/dev/null 2>&1 && command -v iverilog >/dev/null; then
+  if ls "$d"/test_*.py >/dev/null 2>&1; then
+    f2_ran=1
+    if python3 -m pytest -q "$d" > "$TMP/f2py.log" 2>&1; then
+      echo "✓ F2 pytest PASS ($d)"
+    else
+      echo "✗ F2 $d pytest 失败"
+      tail -n 15 "$TMP/f2py.log" | sed 's/^/    /'
+      f2_fail=1
+    fi
+  fi
+  if ls "$d"/*.test.mjs >/dev/null 2>&1; then
+    f2_ran=1
+    if command -v node >/dev/null 2>&1; then
+      if node --test "$d"/*.test.mjs > "$TMP/f2js.log" 2>&1; then
+        echo "✓ F2 node PASS ($d)"
+      else
+        echo "✗ F2 $d node 测试失败"
+        tail -n 15 "$TMP/f2js.log" | sed 's/^/    /'
+        f2_fail=1
+      fi
+    else
+      echo "✗ F2 $d 有 node 测试但没装 node，无法判定（不能判定≠通过）"
+      f2_fail=1
+    fi
+  fi
+  if ls "$d"/tb*.v >/dev/null 2>&1; then
+    f2_ran=1
+    if ! command -v iverilog >/dev/null 2>&1; then
+      echo "✗ F2 $d 有 tb*.v 但没装 iverilog，无法判定（不能判定≠通过）"
+      f2_fail=1
+      continue
+    fi
     duts=$(ls "$d"/*.v 2>/dev/null | grep -vE '/tb[^/]*\.v$' | tr '\n' ' ')
     for tbf in "$d"/tb*.v; do
-      if iverilog -g2012 -o /tmp/gate_sim "$tbf" $duts 2>/dev/null && vvp /tmp/gate_sim >/dev/null 2>&1; then
+      if iverilog -g2012 -o "$TMP/sim" "$tbf" $duts 2>/dev/null && vvp "$TMP/sim" >/dev/null 2>&1; then
         echo "✓ F2 仿真 PASS ($tbf)"
-      else echo "✗ F2 $tbf 仿真失败"; fail=1; fi
+      else
+        echo "✗ F2 $tbf 仿真失败"; f2_fail=1
+      fi
     done
   fi
-  if ls "$d"/test_*.py >/dev/null 2>&1; then
-    if python3 -m pytest -q "$d" >/dev/null 2>&1; then echo "✓ F2 pytest PASS ($d)"
-    else echo "✗ F2 $d pytest 失败"; fail=1; fi
-  fi
-done
+done < "$TMP/dirs"
+if [ "$f2_ran" -eq 0 ]; then
+  echo "· F2 未跑：输入里没有测试入口（test_*.py / *.test.mjs / tb*.v）"
+fi
+if [ "$f2_fail" -eq 1 ]; then
+  log_gate FAIL_F2; echo "GATE: FAIL (F2)"; exit 1
+fi
 
-if [ $fail -eq 0 ]; then log_gate PASS; echo "GATE: PASS"; exit 0
-else log_gate FAIL; echo "GATE: FAIL"; exit 1; fi
+# ---------- 阶段 4 / F3：质量指标（确定性阈值，不是感觉） ----------
+if QC=$(tool qcheck); then
+  if "$QC" --list "$TMP/list"; then
+    :
+  else
+    log_gate FAIL_F3; echo "GATE: FAIL (F3)"; exit 1
+  fi
+else
+  echo "✗ F3 qcheck 未安装，质量指标无法判定（缺工具=不通过）"
+  echo "    修: scripts/install.sh"
+  log_gate FAIL_F3; echo "GATE: FAIL (F3)"; exit 1
+fi
+
+log_gate PASS
+echo "GATE: PASS"
+exit 0

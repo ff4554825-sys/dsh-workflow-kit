@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# qcheck:allow-placeholders
+"""qcheck — F3 质量指标（确定性判据，不是感觉）
+
+用法:
+  qcheck FILE...            逐文件体检
+  qcheck --list LIST.txt    从清单读路径（一行一个，gate 用这个，避开空格引号问题）
+  qcheck --quiet FILE...    只印红的和汇总
+
+判红项（阈值全是 0，任一超限 → 退出码 1）:
+  placeholders  占位符残留（TODO / FIXME / 待补 / XXXX / 「— 略」/ PLACEHOLDER）
+                例外：全文可解析为 JSON/JSONL 的**结构化数据**文件不扫——
+                数据文件的质量由 F1(结构) 与 S(schema) 判；在数据里搜散文占位符只会误伤
+                （真实例子：日志的 lesson 字段引用了这个词，就被判红）
+  empty         0 字节，或只有空白行（空壳交付）
+  utf8          不是合法 UTF-8 文本
+  mixed_eol     文件里 CRLF 与 LF 混用
+
+只报告、不判红：lines / long_lines(>200 字符) / eol
+
+显式豁免：文件前 5 行内出现标记 qcheck:allow-placeholders → 跳过占位符扫描。
+豁免写在文件里，grep 得到，不是静默放过。本文件自己就带这个标记。
+"""
+import json
+import re
+import sys
+import pathlib
+
+PLACEHOLDER_RE = re.compile(r"TODO|FIXME|待补|XXXX|—\s*略|PLACEHOLDER")
+ALLOW_MARK = "qcheck:allow-placeholders"
+BINARY_EXT = {".pyc", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".zip", ".gz",
+              ".zst", ".pdf", ".ico", ".woff", ".woff2", ".ttf", ".so", ".o", ".bin"}
+
+
+def parse_args(argv):
+    paths, listing, quiet = [], None, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--list":
+            i += 1
+            listing = argv[i] if i < len(argv) else None
+        elif a == "--quiet":
+            quiet = True
+        elif a in ("-h", "--help"):
+            print(__doc__ or "").strip()
+            sys.exit(0)
+        else:
+            paths.append(a)
+        i += 1
+    return paths, listing, quiet
+
+
+def is_structured_json(text, nonblank):
+    """整篇可解析为 JSON，或每一非空行都是合法 JSON 对象 → 当作数据文件。"""
+    try:
+        json.loads(text)
+        return True
+    except Exception:
+        pass
+    if not nonblank:
+        return False
+    for x in nonblank:
+        try:
+            if not isinstance(json.loads(x), (dict, list)):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def classify(p):
+    """返回 (red_flags, metrics, detail)"""
+    if not p.exists() or p.is_dir():
+        return ["missing"], {}, "文件不存在" if not p.exists() else "是目录"
+    if p.suffix.lower() in BINARY_EXT:
+        return [], {"lines": 0, "long_lines": 0, "eol": "binary"}, "按扩展名跳过二进制"
+    raw = p.read_bytes()
+    if b"\x00" in raw[:8192]:
+        return [], {"lines": 0, "long_lines": 0, "eol": "binary"}, "含 NUL，按二进制跳过"
+    if not raw:
+        return ["empty"], {"lines": 0, "long_lines": 0, "eol": "-"}, "0 字节"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return ["utf8"], {"lines": 0, "long_lines": 0, "eol": "-"}, "非法 UTF-8: %s" % e
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    lines = text.split("\n")
+    nonblank = [x for x in lines if x.strip()]
+    flags, detail = [], []
+
+    if not nonblank:
+        flags.append("empty")
+        detail.append("只有空白行")
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    if crlf and lf:
+        flags.append("mixed_eol")
+        detail.append("CRLF %d 行 / LF %d 行 混用" % (crlf, lf))
+
+    head = "\n".join(lines[:5])
+    ph = "0"
+    if is_structured_json(text, nonblank):
+        ph = "skip-json"
+    elif ALLOW_MARK not in head:
+        hits = [i + 1 for i, x in enumerate(lines) if PLACEHOLDER_RE.search(x)]
+        if hits:
+            flags.append("placeholders")
+            detail.append("占位符 %d 处（行 %s）" % (len(hits), ",".join(map(str, hits[:8]))))
+            ph = str(len(hits))
+
+    metrics = {
+        "lines": len(nonblank),
+        "long_lines": sum(1 for x in nonblank if len(x) > 200),
+        "eol": "crlf" if crlf and not lf else ("lf" if not crlf else "mixed"),
+        "ph": ph,
+    }
+    return flags, metrics, "；".join(detail)
+
+
+def main():
+    paths, listing, quiet = parse_args(sys.argv[1:])
+    if listing:
+        p = pathlib.Path(listing)
+        if not p.exists():
+            print("✗ F3 清单不存在: %s" % p)
+            sys.exit(2)
+        paths += [x.strip() for x in p.read_text(encoding="utf-8").split("\n") if x.strip()]
+    if not paths:
+        print("用法: qcheck FILE... | qcheck --list LIST.txt")
+        sys.exit(2)
+
+    total = ok = 0
+    red_files = []
+    for name in paths:
+        p = pathlib.Path(name)
+        if p.is_dir():
+            continue
+        total += 1
+        flags, m, detail = classify(p)
+        if flags:
+            red_files.append((name, flags))
+            print("✗ F3 %s %s" % (name, detail))
+        elif not quiet:
+            ok += 1
+            print("✓ F3 %s lines=%d long_lines=%d eol=%s ph=%s" %
+                  (name, m.get("lines", 0), m.get("long_lines", 0),
+                   m.get("eol", "-"), m.get("ph", "0")))
+        else:
+            ok += 1
+
+    if total == 0:
+        print("! F3 没有可检查的文件（全被跳过）")
+        sys.exit(0)
+    if red_files:
+        print("F3: FAIL (%d/%d 文件有质量缺陷)" % (len(red_files), total))
+        sys.exit(1)
+    print("F3: OK (%d 个文件)" % total)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

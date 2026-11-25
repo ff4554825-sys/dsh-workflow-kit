@@ -1,0 +1,82 @@
+#!/bin/sh
+# kit-doctor [REPO_DIR] — 仓库副本与安装副本一致性检查
+#
+# 为什么要有它：安装副本和仓库副本不同步时，你跑的是旧 gate / 旧 log-check，
+# 而文档描述的是新行为——这种偏差不会报错，只会静默地放行不该放行的东西。
+#
+# 判定：逐文件 cmp 仓库副本 vs $DSH_HOME/bin（install 只拷不链，副本会烂）
+#       + 能力探测（装的那份认不认新接口，如 log-check --is-task-log）
+# 退出码：0 一致 / 1 有漂移 / 2 找不到仓库副本
+# 修法：scripts/install.sh
+set -u
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || SELF_DIR=.
+DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+
+repo=""
+for c in "${1:-}" "${KIT_REPO:-}" "$SELF_DIR/.." "$HOME/workspace/dsh-workflow-kit"; do
+  [ -n "$c" ] || continue
+  [ -f "$c/bin/gate" ] && [ -f "$c/README.md" ] || continue
+  repo=$(CDPATH= cd -- "$c" && pwd) || continue
+  break
+done
+if [ -z "$repo" ]; then
+  echo "✗ 找不到仓库副本。用法: kit-doctor [REPO_DIR]  或  KIT_REPO=<仓库路径> kit-doctor"
+  exit 2
+fi
+echo "仓库副本: $repo"
+echo "安装副本: $DSH_HOME/bin"
+
+total=0
+drift=0
+for f in "$repo"/bin/*; do
+  [ -f "$f" ] || continue
+  n=$(basename "$f")
+  total=$((total + 1))
+  g="$DSH_HOME/bin/$n"
+  if [ ! -f "$g" ]; then
+    echo "✗ MISSING bin/$n（安装副本缺失）"
+    drift=$((drift + 1))
+  elif cmp -s "$f" "$g"; then
+    :
+  else
+    echo "✗ DRIFT   bin/$n"
+    drift=$((drift + 1))
+  fi
+done
+
+for rel in verify/logcheck/test_logcheck.py verify/gate/test_gate.sh; do
+  f="$repo/$rel"
+  [ -f "$f" ] || continue
+  total=$((total + 1))
+  if [ ! -f "$DSH_HOME/$rel" ]; then
+    echo "✗ MISSING $rel（安装副本缺失）"
+    drift=$((drift + 1))
+  elif cmp -s "$f" "$DSH_HOME/$rel"; then
+    :
+  else
+    echo "✗ DRIFT   $rel"
+    drift=$((drift + 1))
+  fi
+done
+
+# 能力探测：装的那份能不能识别新接口
+probe="skip"
+if [ -x "$DSH_HOME/bin/log-check" ] && [ -f "$repo/examples/task-log.sample.jsonl" ]; then
+  if "$DSH_HOME/bin/log-check" --is-task-log "$repo/examples/task-log.sample.jsonl" >/dev/null 2>&1; then
+    probe="OK"
+  else
+    probe="不支持"
+    echo "✗ 能力探测 log-check --is-task-log: 不支持（安装副本过旧）"
+    drift=$((drift + 1))
+  fi
+fi
+
+if [ "$drift" -eq 0 ]; then
+  echo "能力探测 log-check --is-task-log: $probe"
+  echo "KIT: IN SYNC ($total 个文件)"
+  exit 0
+fi
+echo "KIT: DRIFT ($drift 个文件不一致 / 共 $total)"
+echo "修: $repo/scripts/install.sh"
+exit 1

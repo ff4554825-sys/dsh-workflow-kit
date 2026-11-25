@@ -2,6 +2,8 @@
 
 一条日志 = 一行 JSON。追加写入，绝不改写。校验器：`bin/log-check`（S 系列编号即本文档的规则号）。
 
+`gate` 触发 S 关的方式：对输入里的 `.json` / `.jsonl` 先跑 `log-check --is-task-log` 做**内容嗅探**（任意一条里同时有 `seq` 和 `ts`，且命中 ≥6 个必备字段，或带 `legacy` 标记）。命中就跑完整校验，不命中明确打印跳过原因。**S 关不依赖文件名**——日志改名成 `notes.jsonl` 照样被查。
+
 ## 17 个字段
 
 | 字段 | 类型 | 含义 | 空值 |
@@ -18,7 +20,7 @@
 | `arbiter` | string | 谁裁决（`pytest` / `现场` / `none` …） | 不允许 |
 | `gate` | object | 三道过滤器结果 + 流程指标 | 不允许 |
 | `red_attempts` | array | 失败尝试，每条带 `sig` 失败签名 | `[]` |
-| `status` | string | `done` / `partial` / `blocked` | 不允许 |
+| `status` | string | 只允许 `done` / `partial` / `blocked`（S11 判） | 不允许 |
 | `acceptance` | array | 验收行，每条 `criterion` + `verdict` + `pointer` | 不允许空 |
 | `review` | string | 回顾段 | `null` |
 | `improve` | object | 改进记账（窗口、发现、动作、到期、能否补回） | 不允许 |
@@ -33,7 +35,7 @@
  "F3_proc":{"rounds":3,"red":0,"source":"auto"}}
 ```
 
-## 校验规则 S1–S10
+## 校验规则 S0–S11
 
 | 编号 | 规则 | 触发即红 |
 |---|---|---|
@@ -48,6 +50,7 @@
 | S8 | `status=blocked` 时 `red_attempts` ≥3 条且都带 `sig` | 挂起太随意 |
 | S9 | `gate.F3_proc.source` 必须是 `auto` | 人工填流程指标 |
 | S10 | `degraded=true` 时 `improve.restore` 必须回答 | 降级了不说能否补回 |
+| S11 | `status` 必须是 `done` / `partial` / `blocked` 之一 | 自造状态词（`finished`、`ok`、`success` 之类） |
 
 ## legacy 豁免
 

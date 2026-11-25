@@ -6,10 +6,11 @@
   aborted —— 只数 tool/result 文本以 "Error: tool call aborted" 开头（回放内容不算）
   gate_runs/gate_fail —— 读 $DSH_HOME/verify/gate-log.jsonl（gate 自己记账），按本会话起始时间过滤
 """
-import sys, json, subprocess, pathlib
+import os, sys, json, subprocess, pathlib
 
-BASE = pathlib.Path.home()/".dsh/sessions/--root-workspace--"
-GLOG = pathlib.Path.home()/".dsh/verify/gate-log.jsonl"
+HOME = pathlib.Path(os.environ.get("DSH_HOME") or (pathlib.Path.home()/".dsh"))
+BASE = HOME/"sessions/--root-workspace--"
+GLOG = HOME/"verify/gate-log.jsonl"
 
 def find_sid():
     if len(sys.argv) > 1:

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""log-check [--file PATH] — task-log schema 校验（v1.0 S1–S10）
+"""log-check [--file PATH] [--is-task-log PATH] — task-log schema 校验（v1.0 S0–S11）
+
+  --file PATH        校验一条日志（默认 $DSH_HOME/task-log.jsonl）
+  --is-task-log PATH 只做内容嗅探：像 task-log 返回 0，不像返回 1，文件不存在返回 2。
+                     给 gate 用，让 S 关按内容触发而不是按文件名（*.jsonl 改名也照样查）。
 
 legacy=true 的历史记录只受 S2(seq 连续)/S3(ts 单调) 约束，其余规则跳过。
 这是显式豁免，不是静默放过。
@@ -9,6 +13,41 @@ import os, sys, json, pathlib
 REQ = ["seq","corrects","ts","task","tier","tier_rule","degraded","evidence",
        "kill_action","arbiter","gate","red_attempts","status","acceptance",
        "review","improve","carryover"]
+
+STATUS_ENUM = ("done", "partial", "blocked")
+
+# 内容嗅探：任意一条可解析对象满足下面之一即为 task-log 形态
+#   1) 有 seq 和 ts，且命中 >= 6 个必备字段（17 个字段里）—— 新记录
+#   2) 有 seq 和 ts，且带 legacy 标记 —— 历史记录字段本来就少，不能因此漏判
+# 必须扫完文件（或到 500 条），不能只看开头：老日志开头全是 legacy 行。
+SNIFF_MIN_FIELDS = 6
+
+
+def is_task_log(path):
+    """返回 (bool, 说明)。只看内容，不看文件名。"""
+    p = pathlib.Path(path).expanduser()
+    if not p.exists():
+        return None, "文件不存在"
+    rows = 0
+    for line in p.read_text(encoding="utf-8", errors="replace").split("\n"):
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(r, dict):
+            continue
+        if "seq" in r and "ts" in r:
+            if "legacy" in r:
+                return True, "命中 task-log 形态（legacy 行）"
+            if sum(1 for k in REQ if k in r) >= SNIFF_MIN_FIELDS:
+                return True, "命中 task-log 形态"
+        rows += 1
+        if rows >= 500:
+            break
+    return False, "不像 task-log（缺 seq/ts 或字段过少）"
+
 
 def check_text(text):
     rows, errs = [], []
@@ -61,15 +100,49 @@ def check_text(text):
                 errs.append(("S9", s, "流程指标 source 不是 auto"))
             if r.get("degraded") and not (r.get("improve") or {}).get("restore"):
                 errs.append(("S10", s, "DEGRADED 未回答能否补回严格判据"))
+            if r.get("status") not in STATUS_ENUM:
+                errs.append(("S11", s, "status 不在枚举 done/partial/blocked: %r" % (r.get("status"),)))
         prev_seq, prev_ts = s, str(r.get("ts", ""))
         seen.add(s)
     return errs
 
+
+def parse_args(argv):
+    path, mode = None, "check"
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--file", "--is-task-log"):
+            mode = "sniff" if a == "--is-task-log" else "check"
+            i += 1
+            path = argv[i] if i < len(argv) else None
+        elif a in ("-h", "--help"):
+            mode = "help"
+        elif path is None:
+            path = a
+        i += 1
+    return mode, path
+
+
 def main():
-    args = sys.argv[1:]
-    default = pathlib.Path(os.environ.get("DSH_HOME", str(pathlib.Path.home()/".dsh")))/"task-log.jsonl"
-    path = args[args.index("--file") + 1] if "--file" in args else (args[0] if args else str(default))
-    p = pathlib.Path(path).expanduser()
+    mode, path = parse_args(sys.argv[1:])
+    if mode == "help":
+        print(__doc__.strip())
+        sys.exit(0)
+
+    if mode == "sniff":
+        if not path:
+            print("用法: log-check --is-task-log PATH")
+            sys.exit(2)
+        verdict, why = is_task_log(path)
+        if verdict is None:
+            print("嗅探失败: %s" % why)
+            sys.exit(2)
+        print(("是 task-log: " if verdict else "不是 task-log: ") + why)
+        sys.exit(0 if verdict else 1)
+
+    default = pathlib.Path(os.environ.get("DSH_HOME", str(pathlib.Path.home() / ".dsh"))) / "task-log.jsonl"
+    p = pathlib.Path(path).expanduser() if path else default
     if not p.exists():
         print("S0 文件不存在: %s" % p)
         sys.exit(1)
@@ -78,6 +151,7 @@ def main():
         print("%s seq=%s %s" % (code, seq, msg))
     print("SCHEMA: FAIL" if errs else "SCHEMA: OK")
     sys.exit(1 if errs else 0)
+
 
 if __name__ == "__main__":
     main()
