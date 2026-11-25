@@ -1,0 +1,80 @@
+#!/bin/sh
+# gate <文件或目录...>  交付三道过滤器：F1 解析/编译  F2 测试  F3 质量指标
+fail=0
+DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+GLOG="$DSH_HOME/verify/gate-log.jsonl"
+log_gate() { mkdir -p "$(dirname "$GLOG")"; printf '{"ts":"%s","result":"%s","files":%s}\n' "$(date -Iseconds)" "$1" "$NFILES" >> "$GLOG"; }
+NFILES=$#
+[ $# -eq 0 ] && { echo "用法: gate <文件或目录>..."; exit 2; }
+
+# ---------- S 系列：task-log schema 前置校验（红则不进入 F1/F2） ----------
+SFAIL=0
+for a in "$@"; do
+  case "$(basename "$a")" in
+    *task-log*.jsonl)
+      if [ -x "$DSH_HOME/bin/log-check" ]; then
+        if out=$("$DSH_HOME/bin/log-check" --file "$a" 2>&1); then
+          echo "✓ S schema PASS ($(basename "$a"))"
+        else
+          echo "✗ S $a schema 校验失败"
+          printf '%s\n' "$out" | sed 's/^/    /'
+          SFAIL=1
+        fi
+      else
+        echo "! S log-check 不存在，跳过 schema 校验"
+      fi ;;
+    *.jsonl)
+      echo "! S $a 不匹配 task-log* 命名，S 系列未校验（显式提示，非静默跳过）" ;;
+  esac
+done
+if [ "$SFAIL" -eq 1 ]; then log_gate FAIL_S; echo "GATE: FAIL (S)"; exit 1; fi
+
+# 目录展开成文件
+LIST=""
+for a in "$@"; do
+  if [ -d "$a" ]; then
+    for g in "$a"/*; do [ -f "$g" ] && LIST="$LIST
+$g"; done
+  else
+    LIST="$LIST
+$a"
+  fi
+done
+
+printf '%s\n' "$LIST" | while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  [ -f "$f" ] || { echo "✗ F0 $f 不存在"; echo FAIL > /tmp/gate_fail.$$; continue; }
+  case "$f" in
+    *.md) [ $(( $(grep -c '^```' "$f") % 2 )) -eq 0 ] || { echo "✗ F1 $f 代码围栏不成对"; echo FAIL > /tmp/gate_fail.$$; }
+          grep -q 'TODO\|FIXME\|待补\|— 略' "$f" && { echo "✗ F3 $f 残留占位符"; echo FAIL > /tmp/gate_fail.$$; } ;;
+    *.json|*.jsonl) jq -e . "$f" >/dev/null 2>&1 || { echo "✗ F1 $f JSON 非法"; echo FAIL > /tmp/gate_fail.$$; } ;;
+    *.py) python3 -m py_compile "$f" 2>/dev/null || { echo "✗ F1 $f python 语法"; echo FAIL > /tmp/gate_fail.$$; } ;;
+    *.sh) bash -n "$f" 2>/dev/null || { echo "✗ F1 $f shell 语法"; echo FAIL > /tmp/gate_fail.$$; } ;;
+    *.v)
+      case "$(basename "$f")" in
+        tb*) : ;;  # 测试台单独编译必失败（缺模块），交由 F2 整体编译
+        *) command -v iverilog >/dev/null && { iverilog -g2012 -o /dev/null "$f" 2>/dev/null || { echo "✗ F1 $f verilog 编译"; echo FAIL > /tmp/gate_fail.$$; }; } ;;
+      esac ;;
+  esac
+done
+[ -f /tmp/gate_fail.$$ ] && fail=1; rm -f /tmp/gate_fail.$$
+
+# F2 测试：按目录整体编译仿真 / 跑 pytest
+for d in $(printf '%s\n' "$LIST" | xargs -n1 dirname 2>/dev/null | sort -u); do
+  [ -d "$d" ] || continue
+  if ls "$d"/tb*.v >/dev/null 2>&1 && command -v iverilog >/dev/null; then
+    duts=$(ls "$d"/*.v 2>/dev/null | grep -vE '/tb[^/]*\.v$' | tr '\n' ' ')
+    for tbf in "$d"/tb*.v; do
+      if iverilog -g2012 -o /tmp/gate_sim "$tbf" $duts 2>/dev/null && vvp /tmp/gate_sim >/dev/null 2>&1; then
+        echo "✓ F2 仿真 PASS ($tbf)"
+      else echo "✗ F2 $tbf 仿真失败"; fail=1; fi
+    done
+  fi
+  if ls "$d"/test_*.py >/dev/null 2>&1; then
+    if python3 -m pytest -q "$d" >/dev/null 2>&1; then echo "✓ F2 pytest PASS ($d)"
+    else echo "✗ F2 $d pytest 失败"; fail=1; fi
+  fi
+done
+
+if [ $fail -eq 0 ]; then log_gate PASS; echo "GATE: PASS"; exit 0
+else log_gate FAIL; echo "GATE: FAIL"; exit 1; fi

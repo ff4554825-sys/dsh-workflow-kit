@@ -1,0 +1,80 @@
+#!/bin/sh
+# task-report [天数] — 周期报告（v1.0 + legacy 兼容），默认写到 $DSH_HOME/reports/
+DAYS="${1:-0}"
+node -e '
+const fs=require("fs"), path=require("path");
+const H=process.env.DSH_HOME||(process.env.HOME+"/.dsh");
+const LOG=H+"/task-log.jsonl";
+const OUTDIR=process.env.TASK_REPORT_DIR||(H+"/reports");
+const days=Number(process.argv[1]||0);
+let rows=[];
+try{rows=fs.readFileSync(LOG,"utf8").split("\n").filter(Boolean).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean)}catch(e){}
+const tsOf=r=>r.ts||r.at||"";
+if(days>0){const cut=Date.now()-days*86400000; rows=rows.filter(r=>{const t=new Date(tsOf(r)).getTime(); return !isNaN(t)&&t>=cut;});}
+if(!rows.length){console.log("没有记录");process.exit(0)}
+const bucket=r=>{const s=(r.status!==undefined?r.status:r.result);
+  if(s==="done"||s==="success")return "success";
+  if(s==="blocked"||s==="fail")return "fail";
+  if(s==="partial")return "partial";
+  return "unknown";};
+const n=rows.length, c={success:0,partial:0,fail:0,unknown:0};
+const tools={}, lessons={}, fails=[];
+const verdicts={PASS:0,FAIL:0,UNKNOWN:0};
+let red=0, degraded=0, v10=0;
+rows.forEach(r=>{
+  c[bucket(r)]++;
+  if(r.status!==undefined)v10++;
+  if(r.degraded===true)degraded++;
+  red+=(r.red_attempts||[]).length;
+  (r.acceptance||[]).forEach(a=>{if(verdicts[a.verdict]!==undefined)verdicts[a.verdict]++});
+  (r.tools||[]).forEach(t=>tools[t]=(tools[t]||0)+1);
+  const les=r.lesson||r.improve&&r.improve.finding;
+  if(les)lessons[les]=(lessons[les]||0)+1;
+  if(bucket(r)!=="success")fails.push(r);
+});
+const pct=x=>n?Math.round(x/n*100):0;
+const L=[];
+L.push("# 任务总结报告","");
+L.push(`- 生成时间：${new Date().toLocaleString("sv-SE",{timeZone:"Asia/Shanghai"})}`);
+L.push(`- 统计范围：${days>0?"最近 "+days+" 天":"全部记录"}（${n} 个任务；v1.0 schema ${v10} 条 / legacy ${n-v10} 条）`);
+L.push("");
+L.push("## 成功率","| 结果 | 数量 | 占比 |","|---|---|---|");
+L.push(`| ✅ 成功 | ${c.success} | ${pct(c.success)}% |`);
+L.push(`| ⚠️ 部分达成 | ${c.partial} | ${pct(c.partial)}% |`);
+L.push(`| ❌ 失败 | ${c.fail} | ${pct(c.fail)}% |`);
+if(c.unknown)L.push(`| ❓ 未知 | ${c.unknown} | ${pct(c.unknown)}% |`);
+L.push("","## 外部判定（acceptance.verdict）","| 判定 | 条数 |","|---|---|");
+L.push(`| PASS | ${verdicts.PASS} |`);
+L.push(`| FAIL | ${verdicts.FAIL} |`);
+L.push(`| UNKNOWN | ${verdicts.UNKNOWN} |`);
+L.push("",`- 返工（red_attempts）合计 ${red} 次；degraded 记录 ${degraded} 条`);
+if(v10===0)L.push("- 注意：本次统计没有 v1.0 记录，外部判定列为空属于正常");
+L.push("","## 工具使用");
+const tlist=Object.entries(tools).sort((a,b)=>b[1]-a[1]);
+L.push(tlist.length?tlist.map(([k,v])=>`- \`${k}\` × ${v}`).join("\n"):"- 无记录（v1.0 schema 不再记 tools 字段）");
+L.push("","## 未一次成功的任务");
+if(fails.length){fails.slice(-15).forEach(f=>{L.push(`- **${f.task}**（${bucket(f)}，seq=${f.seq}）`);
+  const why=f.why||f.evidence; if(why)L.push(`  - 依据：${why}`);
+  const les=f.lesson||f.review; if(les)L.push(`  - 复盘：${String(les).slice(0,200)}`);});}
+else L.push("- 无，全部一次通过");
+L.push("","## 经验汇总");
+const lso=Object.entries(lessons).sort((a,b)=>b[1]-a[1]).slice(0,12);
+L.push(lso.length?lso.map(([k,v])=>`- ${k}（×${v}）`).join("\n"):"- 无");
+L.push("","## 改进措施（自动推导）");
+const adv=[];
+if(c.fail>0) adv.push(`- 有 ${c.fail} 个失败任务，先复盘「依据」列找重复模式`);
+if(verdicts.FAIL>0) adv.push(`- 外部判定 FAIL ${verdicts.FAIL} 条：自评与外部判定不一致，收尾补验证再报完成`);
+if(c.partial>Math.max(1,n*0.2)) adv.push(`- 部分达成 ${pct(c.partial)}%，交付但没验证的情况偏多，收尾要补验证`);
+if(degraded>0) adv.push(`- 有 ${degraded} 条 degraded：通道失效时靠可粘贴件交付，下一轮要补严格判据`);
+const tt=tlist[0];
+if(tt&&tt[1]>n*2) adv.push(`- \`${tt[0]}\` 被调 ${tt[1]} 次，考虑批量化`);
+if(lso.length&&lso[0][1]>=3) adv.push(`- 同一条教训出现 ${lso[0][1]} 次：${lso[0][0]} —— 该写成硬规则`);
+adv.push("- 样本少于 10 条时不下结论");
+L.push(adv.join("\n"));
+const stamp=new Date().toLocaleString("sv-SE",{timeZone:"Asia/Shanghai"}).slice(0,10);
+fs.mkdirSync(OUTDIR,{recursive:true});
+const out=path.join(OUTDIR,`任务总结-${stamp}.md`);
+fs.writeFileSync(out,L.join("\n"));
+console.log("报告:",out);
+console.log(`总任务 ${n} | 成功 ${c.success} (${pct(c.success)}%) | 部分 ${c.partial} | 失败 ${c.fail} | PASS ${verdicts.PASS} FAIL ${verdicts.FAIL}`);
+' "$DAYS"

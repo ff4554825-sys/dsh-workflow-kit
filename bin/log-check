@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""log-check [--file PATH] — task-log schema 校验（v1.0 S1–S10）
+
+legacy=true 的历史记录只受 S2(seq 连续)/S3(ts 单调) 约束，其余规则跳过。
+这是显式豁免，不是静默放过。
+"""
+import os, sys, json, pathlib
+
+REQ = ["seq","corrects","ts","task","tier","tier_rule","degraded","evidence",
+       "kill_action","arbiter","gate","red_attempts","status","acceptance",
+       "review","improve","carryover"]
+
+def check_text(text):
+    rows, errs = [], []
+    for ln, line in enumerate(text.split("\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception as e:
+            errs.append(("S0", ln, "JSON 非法: %s" % e))
+    if not rows:
+        return errs or [("S0", 0, "空日志")]
+
+    prev_seq = prev_ts = None
+    seen = set()
+    for r in rows:
+        s = r.get("seq")
+        legacy = r.get("legacy") is True
+        if not isinstance(s, int):
+            errs.append(("S1", s, "seq 缺失或非整数"))
+            continue
+        if prev_seq is not None and s != prev_seq + 1:
+            errs.append(("S2", s, "seq 不连续，应为 %d" % (prev_seq + 1)))
+        if prev_ts is not None and str(r.get("ts", "")) < prev_ts:
+            errs.append(("S3", s, "ts 时间倒退"))
+        if not legacy:
+            miss = [k for k in REQ if k not in r]
+            if miss:
+                errs.append(("S1", s, "字段缺失 " + ",".join(miss)))
+            if r.get("corrects") is not None and r["corrects"] not in seen:
+                errs.append(("S4", s, "corrects=%s 指向不存在" % r["corrects"]))
+            acc = r.get("acceptance") or []
+            if not acc:
+                errs.append(("S5", s, "acceptance 为空"))
+            else:
+                for a in acc:
+                    if a.get("verdict") not in ("PASS", "FAIL", "UNKNOWN") or not a.get("pointer"):
+                        errs.append(("S5", s, "验收行缺 verdict 或 pointer"))
+                        break
+            f2 = (r.get("gate") or {}).get("F2") or {}
+            if isinstance(f2, dict) and not f2.get("coverage"):
+                errs.append(("S6", s, "F2 缺覆盖凭据"))
+            if r.get("arbiter") == "none" and not r.get("arbiter_reason"):
+                errs.append(("S7", s, "声称无外部裁决者但未写理由"))
+            if r.get("status") == "blocked":
+                ra = r.get("red_attempts") or []
+                if len(ra) < 3 or any(not x.get("sig") for x in ra):
+                    errs.append(("S8", s, "BLOCKED 但 red_attempts 不足 3 次或缺签名"))
+            if ((r.get("gate") or {}).get("F3_proc") or {}).get("source") != "auto":
+                errs.append(("S9", s, "流程指标 source 不是 auto"))
+            if r.get("degraded") and not (r.get("improve") or {}).get("restore"):
+                errs.append(("S10", s, "DEGRADED 未回答能否补回严格判据"))
+        prev_seq, prev_ts = s, str(r.get("ts", ""))
+        seen.add(s)
+    return errs
+
+def main():
+    args = sys.argv[1:]
+    default = pathlib.Path(os.environ.get("DSH_HOME", str(pathlib.Path.home()/".dsh")))/"task-log.jsonl"
+    path = args[args.index("--file") + 1] if "--file" in args else (args[0] if args else str(default))
+    p = pathlib.Path(path).expanduser()
+    if not p.exists():
+        print("S0 文件不存在: %s" % p)
+        sys.exit(1)
+    errs = check_text(p.read_text(encoding="utf-8"))
+    for code, seq, msg in errs:
+        print("%s seq=%s %s" % (code, seq, msg))
+    print("SCHEMA: FAIL" if errs else "SCHEMA: OK")
+    sys.exit(1 if errs else 0)
+
+if __name__ == "__main__":
+    main()

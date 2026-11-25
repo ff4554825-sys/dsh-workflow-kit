@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""proc-stats [SESSION_ID] — 流程指标自动统计（供日志 F3_proc.source=auto）
+
+口径：
+  rounds/steps/tool_calls/interrupts —— 数会话流里的事件
+  aborted —— 只数 tool/result 文本以 "Error: tool call aborted" 开头（回放内容不算）
+  gate_runs/gate_fail —— 读 $DSH_HOME/verify/gate-log.jsonl（gate 自己记账），按本会话起始时间过滤
+"""
+import sys, json, subprocess, pathlib
+
+BASE = pathlib.Path.home()/".dsh/sessions/--root-workspace--"
+GLOG = pathlib.Path.home()/".dsh/verify/gate-log.jsonl"
+
+def find_sid():
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    best, bt = None, -1
+    for d in BASE.glob("session-*"):
+        f = d/"session.v4.jsonl.zstd"
+        if f.exists() and f.stat().st_mtime > bt:
+            best, bt = d.name, f.stat().st_mtime
+    return best
+
+def result_text(d):
+    try:
+        return d["message"]["content"][0]["text"]
+    except Exception:
+        return ""
+
+def main():
+    sid = find_sid()
+    f = BASE/sid/"session.v4.jsonl.zstd"
+    if not f.exists():
+        print(json.dumps({"error": "未找到会话流: %s" % f})); sys.exit(1)
+    raw = subprocess.run(["zstd", "-dc", str(f)], capture_output=True).stdout.decode("utf-8", "replace")
+    n = {"rounds": 0, "steps": 0, "tool_calls": 0, "aborted": 0, "interrupts": 0}
+    first_ts = None
+    for line in raw.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if first_ts is None and e.get("time"):
+            first_ts = e["time"]
+        t = e.get("type", "")
+        if t == "turn/start": n["rounds"] += 1
+        elif t == "step/start": n["steps"] += 1
+        elif t == "tool/call": n["tool_calls"] += 1
+        elif t == "tool/result":
+            if result_text(e.get("data") or {}).strip().startswith("Error: tool call aborted"):
+                n["aborted"] += 1
+        elif "inbox/spliced" in t:
+            n["interrupts"] += 1
+
+    n["gate_runs"] = n["gate_fail"] = 0
+    if GLOG.exists() and first_ts:
+        for line in GLOG.read_text(encoding="utf-8").split("\n"):
+            if not line.strip():
+                continue
+            try:
+                g = json.loads(line)
+            except Exception:
+                continue
+            import datetime as dt
+            try:
+                t = dt.datetime.fromisoformat(g["ts"]).timestamp()*1000
+            except Exception:
+                continue
+            if t >= first_ts:
+                n["gate_runs"] += 1
+                if g.get("result") != "PASS":
+                    n["gate_fail"] += 1
+    n["session"] = sid
+    n["source"] = "auto"
+    print(json.dumps(n, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
