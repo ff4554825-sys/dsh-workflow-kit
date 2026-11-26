@@ -195,3 +195,65 @@ def test_new_row_with_legacy_key_is_red():
          "tier": "lite", "status": "done", "evidence": "e", "legacy": True}
     code, out = run([t])
     assert code == 1 and "禁用该键: legacy" in out, out
+
+
+def _sealed_log():
+    """老行 → schema → seal，返回行列表与封存后的文件内容构造器。"""
+    old = {"seq": 1, "ts": "2026-11-25T09:00:00+08:00", "task": "老", "status": "done"}
+    cut = {"record_type": "schema", "session_id": "s1", "seq": 2,
+           "ts": "2026-11-25T10:00:00+08:00", "spec": "1.2", "freezes_seq_lte": 1}
+    return [old, cut]
+
+
+def _seal_rows(rows):
+    """按 log-write 的算法算出 seal 行（测试独立实现，避免自证）。"""
+    import hashlib
+    canon = lambda r: json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    dg = hashlib.sha256("".join(canon(r) for r in rows).encode()).hexdigest()
+    ph = hashlib.sha256(canon(rows[-1]).encode()).hexdigest()
+    return {"record_type": "seal", "session_id": "s1", "seq": len(rows) + 1,
+            "ts": "2026-11-25T10:01:00+08:00", "through_seq": len(rows),
+            "digest": dg, "prev_hash": ph}
+
+
+def test_seal_valid_chain_passes():
+    rows = _sealed_log()
+    code, out = run(rows + [_seal_rows(rows)])
+    assert code == 0, out
+
+
+def test_tampering_legacy_row_breaks_digest():
+    rows = _sealed_log()
+    seal = _seal_rows(rows)
+    rows[0]["task"] = "被我改过的历史"
+    code, out = run(rows + [seal])
+    assert code == 1 and "V14" in out and "摘要不匹配" in out, out
+
+
+def test_tampering_sealed_row_breaks_chain():
+    rows = _sealed_log()
+    seal = _seal_rows(rows)
+    a = {"record_type": "task", "session_id": "s1", "seq": 4,
+         "ts": "2026-11-25T10:02:00+08:00", "executor_id": "ex-1", "task": "t",
+         "tier": "lite", "status": "done", "evidence": "e"}
+    a["prev_hash"] = _seal_rows(rows)["prev_hash"] if False else None
+    import hashlib
+    canon = lambda r: json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    a["prev_hash"] = hashlib.sha256(canon(seal).encode()).hexdigest()
+    a["task"] = "事后被改"          # 改了内容却不改 prev_hash → 下一行断链
+    b = dict(a, seq=5, ts="2026-11-25T10:03:00+08:00")
+    b["prev_hash"] = hashlib.sha256(canon(dict(a, task="原内容")).encode()).hexdigest()
+    code, out = run(rows + [seal, a, b])
+    assert code == 1 and "V14" in out and "断链" in out, out
+
+
+def test_phone_number_in_evidence_is_red():
+    t = base_task(evidence="联系 13812345678 处理")
+    code, out = run([t])
+    assert code == 1 and "V11" in out, out
+
+
+def test_hex_hash_with_digits_is_not_red():
+    t = base_task(evidence="sha256 4f1e9c2a77b0d3e5f60718293a4b5c6d7e8f9012345678abcdef0123456789ab")
+    code, out = run([t])
+    assert code == 0, out

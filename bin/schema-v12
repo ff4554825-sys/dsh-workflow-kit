@@ -27,6 +27,16 @@ def e(code, ln, msg):
     return {"code": code, "line": ln, "msg": msg}
 
 
+def canon(row):
+    """用于完整性链的规范形：键排序、无空白、保留非 ASCII 原文。"""
+    return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def is_str(v):
     return isinstance(v, str) and v.strip() != ""
 
@@ -185,6 +195,26 @@ def check_schema(r, ln):
     return errs
 
 
+def check_seal(r, ln, rows, idx):
+    """V14：legacy 前缀摘要 + 其后逐行 prev_hash 链。"""
+    errs = []
+    for k, typ in (("record_type", str), ("session_id", str), ("seq", int), ("ts", str),
+                   ("through_seq", int), ("digest", str)):
+        if k not in r:
+            errs.append(e("V2", ln, "seal 缺 %s" % k))
+        elif typ is int and not (isinstance(r[k], int) and not isinstance(r[k], bool)):
+            errs.append(e("V2", ln, "seal.%s 必须是整数" % k))
+    ts_ = r.get("through_seq")
+    if isinstance(ts_, int):
+        if ts_ != idx:                      # rows 是 0-based，前缀长度应为 idx
+            errs.append(e("V14", ln, "through_seq 应为 %d 实为 %d（必须等于此前行数）" % (idx, ts_)))
+        body = "".join(canon(x) for _i, x in rows[:idx])
+        want = sha(body)
+        if r.get("digest") != want:
+            errs.append(e("V14", ln, "legacy 前缀摘要不匹配：应为 %s…" % want[:16]))
+    return errs
+
+
 def check_accept(r, ln, tasks):
     errs, spec = [], MATRIX["accept_record"]
     for k in spec["required"]:
@@ -326,6 +356,8 @@ def main(argv):
     # ---- 先找 §8 切割点（分片 = 文件，一个文件只准一条） ----
     schemas = [(idx, ln, r) for idx, (ln, r) in enumerate(rows)
                if isinstance(r, dict) and r.get("record_type") == "schema"]
+    seals = [(idx, ln, r) for idx, (ln, r) in enumerate(rows)
+             if isinstance(r, dict) and r.get("record_type") == "seal"]
     freezes = None
     if schemas:
         if len(schemas) > 1:
@@ -342,6 +374,21 @@ def main(argv):
         if isinstance(fz, int) and fz != prev_max:
             errs.append(e("V4", ln, "freezes_seq_lte 应为 %d 实为 %d" % (prev_max, fz)))
         freezes = fz if isinstance(fz, int) else prev_max
+
+    # ---- V14 完整性：seal 摘要 + prev_hash 链 ----
+    if seals:
+        if len(seals) > 1:
+            errs.append(e("V14", seals[1][1], "一个分片只允许一条 seal 事件"))
+        sidx, sln, sr = seals[0]
+        errs += check_seal(sr, sln, rows, sidx)
+        prev = canon(rows[sidx])
+        for j in range(sidx + 1, len(rows)):
+            rj = rows[j][1]
+            if not isinstance(rj, dict):
+                continue
+            if rj.get("prev_hash") != sha(prev):
+                errs.append(e("V14", rows[j][0], "prev_hash 断链（第 %d 行）" % rows[j][0]))
+            prev = canon(rj)
 
     # ---- V1 与分类 ----
     tasks, gates, accepts = {}, [], []
@@ -382,9 +429,8 @@ def main(argv):
             gates.append(r)
         elif rt == "accept":
             accepts.append(r)
-        elif rt == "schema":
-            if r.get("spec") != "1.2":
-                pass  # 已在 check_schema 报 V3
+        elif rt in ("schema", "seal"):
+            pass  # 已在上面单独校验
         else:
             errs.append(e("V3", ln, "未知 record_type: %r" % rt))
 

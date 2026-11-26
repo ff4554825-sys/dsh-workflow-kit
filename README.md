@@ -171,9 +171,13 @@ accept 事件折叠，模型不得在 task 行写死 `PASS`/`FAIL`。规范原�
 ./bin/log-write --accept --target-seq 43 --verdict PASS \
                 --reviewer user --pointer "review://…"
 ./bin/task-stats                                    # 两套口径分开报，不相加
+                                                    # 统计唯一实现是 bin/v12-model
 ```
 
-必红样例在 `verify/v12`（24 条，含「模型自写 PASS」「gate 超时却 exit 0」
+完整性：`log-write --seal` 给现有前缀打摘要，之后每行自动带 `prev_hash`；
+改写任意一行都会在 seal 或下一行断链（V14），见 `docs/v12-integrity.md`。
+
+必红样例在 `verify/v12`（30 条，含「模型自写 PASS」「gate 超时却 exit 0」
 「reviewer 自己审自己」「corrects 成环」「切割点写错」「两条 schema 事件」），
 已并入 `scripts/selftest.sh`。
 

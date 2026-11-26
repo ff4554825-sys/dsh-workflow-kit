@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""v12-model — 统计的唯一实现（task-stats / task-report 都只调它）
+
+输出 JSON：
+  cut       是否已切割（文件里有 schema 事件）
+  legacy    {rows, seq_ok, stats:{success,partial,fail,unknown,verdicts,red,degraded,tools,with_status}}
+  modern    {tasks, gates, accepts, delivered, accepted, open, items:[{seq,state,verdicts}]}
+两套口径分开，调用方不得相加。
+"""
+import json, os, sys, pathlib
+
+HOME = pathlib.Path(os.environ.get("DSH_HOME", pathlib.Path.home() / ".dsh"))
+LOG = pathlib.Path(os.environ.get("TASK_LOG", HOME / "task-log.jsonl"))
+
+
+def bucket(r):
+    s = r.get("status", r.get("result"))
+    if s in ("done", "success"):
+        return "success"
+    if s in ("blocked", "fail"):
+        return "fail"
+    if s == "partial":
+        return "partial"
+    return "unknown"
+
+
+def legacy_stats(rows):
+    c = {"success": 0, "partial": 0, "fail": 0, "unknown": 0}
+    verdicts = {"PASS": 0, "FAIL": 0, "UNKNOWN": 0}
+    tools, red, degraded, with_status = {}, 0, 0, 0
+    ok, prev, prev_ts = True, 0, None
+    for r in rows:
+        c[bucket(r)] += 1
+        if "status" in r:
+            with_status += 1
+        if r.get("degraded") is True:
+            degraded += 1
+        red += len(r.get("red_attempts") or [])
+        for a in r.get("acceptance") or []:
+            if a.get("verdict") in verdicts:
+                verdicts[a["verdict"]] += 1
+        for t in r.get("tools") or []:
+            tools[t] = tools.get(t, 0) + 1
+        seq = r.get("seq")
+        if isinstance(seq, int):
+            if seq != prev + 1:
+                ok = False
+            prev = seq
+        ts = r.get("ts")
+        if isinstance(ts, str):
+            if prev_ts is not None and ts < prev_ts:
+                ok = False
+            prev_ts = ts
+    top = sorted(tools.items(), key=lambda kv: -kv[1])[:8]
+    return {"success": c["success"], "partial": c["partial"], "fail": c["fail"],
+            "unknown": c["unknown"], "verdicts": verdicts, "red": red,
+            "degraded": degraded, "tools": dict(top), "with_status": with_status,
+            "seq_ok": ok}
+
+
+def modern_model(rows):
+    tasks, gates, accepts = {}, {}, []
+    for r in rows:
+        rt = r.get("record_type")
+        if rt == "task":
+            tasks[r.get("seq")] = r
+        elif rt == "gate":
+            k = r.get("target_seq")
+            cur = gates.get(k)
+            if cur is None or (r.get("ts", ""), r.get("seq", 0)) > (cur.get("ts", ""), cur.get("seq", 0)):
+                gates[k] = r
+        elif rt == "accept":
+            accepts.append(r)
+    items = []
+    for seq, t in tasks.items():
+        vmap = {}
+        for a in t.get("acceptance") or []:
+            if isinstance(a, dict) and a.get("id"):
+                vmap[a["id"]] = a.get("verdict") or "PENDING"
+        evs = sorted([a for a in accepts if (a.get("target") or {}).get("seq") == seq],
+                     key=lambda a: (a.get("ts", ""), a.get("seq", 0)))
+        whole = [a for a in evs if not (a.get("target") or {}).get("criterion_id")]
+        per = {(a["target"].get("criterion_id")): a.get("verdict") for a in evs
+               if (a.get("target") or {}).get("criterion_id") and a["target"]["criterion_id"] in vmap}
+        vmap.update(per)
+        for cid in list(vmap):
+            if cid not in per and whole:
+                vmap[cid] = whole[-1].get("verdict")
+        g = gates.get(seq)
+        delivered = bool(g and g.get("result") == "PASS")
+        if vmap:
+            all_pass = all(v == "PASS" for v in vmap.values())
+        else:
+            all_pass = bool(whole) and whole[-1].get("verdict") == "PASS"
+        accepted = delivered and all_pass
+        items.append({"seq": seq, "tier": t.get("tier"), "delivered": delivered,
+                      "accepted": accepted, "state": "accepted" if accepted else "open",
+                      "verdicts": vmap, "task": t.get("task")})
+    return {"tasks": len(tasks), "gates": len(gates), "accepts": len(accepts),
+            "delivered": sum(1 for i in items if i["delivered"]),
+            "accepted": sum(1 for i in items if i["accepted"]),
+            "open": sum(1 for i in items if not i["accepted"]),
+            "items": items}
+
+
+def main():
+    if not LOG.exists():
+        print(json.dumps({"cut": None, "legacy": None, "modern": None})); return 0
+    rows = [json.loads(l) for l in LOG.read_text(encoding="utf-8").split("\n") if l.strip()]
+    cut = next((r for r in rows if r.get("record_type") == "schema"), None)
+    out = {"cut": bool(cut), "log": str(LOG), "rows": len(rows)}
+    if not cut:
+        out["legacy"] = legacy_stats(rows)
+        out["modern"] = None
+        print(json.dumps(out, ensure_ascii=False)); return 0
+    fz = cut.get("freezes_seq_lte") or 0
+    legacy = [r for r in rows if isinstance(r.get("seq"), int) and r["seq"] <= fz]
+    modern = [r for r in rows if not (isinstance(r.get("seq"), int) and r["seq"] <= fz)]
+    out["freezes_seq_lte"] = fz
+    out["legacy"] = dict(legacy_stats(legacy), rows=len(legacy))
+    out["modern"] = modern_model(modern)
+    print(json.dumps(out, ensure_ascii=False)); return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

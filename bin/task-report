@@ -1,116 +1,118 @@
-#!/bin/sh
-# task-report [天数] — 周期报告（v1.0 + legacy 兼容）
-# 输出目录优先级：$TASK_REPORT_DIR → $DSH_HOME/reports-dir 文件里的一行 → $DSH_HOME/reports/
-# 本机固定的目录写进 reports-dir，别改脚本——改脚本会让安装副本和仓库副本漂移。
-DAYS="${1:-0}"
-node -e '
-const fs=require("fs"), path=require("path");
-const H=process.env.DSH_HOME||(process.env.HOME+"/.dsh");
-const LOG=H+"/task-log.jsonl";
-let cfgDir=""; try{cfgDir=fs.readFileSync(H+"/reports-dir","utf8").trim()}catch(e){}
-const OUTDIR=process.env.TASK_REPORT_DIR||cfgDir||(H+"/reports");
-const days=Number(process.argv[1]||0);
-let rows=[];
-try{rows=fs.readFileSync(LOG,"utf8").split("\n").filter(Boolean).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean)}catch(e){}
-const tsOf=r=>r.ts||r.at||"";
-if(days>0){const cut=Date.now()-days*86400000; rows=rows.filter(r=>{const t=new Date(tsOf(r)).getTime(); return !isNaN(t)&&t>=cut;});}
-if(!rows.length){console.log("没有记录");process.exit(0)}
-// §8 切割：有 schema 事件就两套口径分开，不相加
-const cutRow=rows.find(r=>r&&r.record_type==="schema");
-let legacyRows=rows, modernRows=[];
-if(cutRow){const fz=cutRow.freezes_seq_lte|0;
-  legacyRows=rows.filter(r=>typeof r.seq==="number"&&r.seq<=fz);
-  modernRows=rows.filter(r=>!(typeof r.seq==="number"&&r.seq<=fz));}
-const bucket=r=>{const s=(r.status!==undefined?r.status:r.result);
-  if(s==="done"||s==="success")return "success";
-  if(s==="blocked"||s==="fail")return "fail";
-  if(s==="partial")return "partial";
-  return "unknown";};
-const n=legacyRows.length, c={success:0,partial:0,fail:0,unknown:0};
-const tools={}, lessons={}, fails=[];
-const verdicts={PASS:0,FAIL:0,UNKNOWN:0};
-let red=0, degraded=0, v10=0;
-legacyRows.forEach(r=>{
-  c[bucket(r)]++;
-  if(r.status!==undefined)v10++;
-  if(r.degraded===true)degraded++;
-  red+=(r.red_attempts||[]).length;
-  (r.acceptance||[]).forEach(a=>{if(verdicts[a.verdict]!==undefined)verdicts[a.verdict]++});
-  (r.tools||[]).forEach(t=>tools[t]=(tools[t]||0)+1);
-  const les=r.lesson||r.improve&&r.improve.finding;
-  if(les)lessons[les]=(lessons[les]||0)+1;
-  if(bucket(r)!=="success")fails.push(r);
-});
-const pct=x=>n?Math.round(x/n*100):0;
-const L=[];
-L.push("# 任务总结报告","");
-L.push(`- 生成时间：${new Date().toLocaleString("sv-SE",{timeZone:"Asia/Shanghai"})}`);
-L.push(`- 统计范围：${days>0?"最近 "+days+" 天":"全部记录"}（legacy/自评集 ${n} 条；v1.0 schema ${v10} 条）`);
-L.push("");
-if(cutRow){
-  const tasks=new Map(),gates=new Map(),acc=[];
-  modernRows.forEach(r=>{
-    if(r.record_type==="task")tasks.set(r.seq,r);
-    else if(r.record_type==="gate"){const k=r.target_seq,cur=gates.get(k);
-      if(!cur||(r.ts||"")>(cur.ts||"")||((r.ts||"")===(cur.ts||"")&&r.seq>cur.seq))gates.set(k,r);}
-    else if(r.record_type==="accept")acc.push(r);
-  });
-  let delivered=0,accepted=0,open=0;
-  tasks.forEach((t,seq)=>{
-    const vmap={};(t.acceptance||[]).forEach(a=>{if(a&&a.id)vmap[a.id]=a.verdict||"PENDING"});
-    const evs=acc.filter(a=>a.target&&a.target.seq===seq);
-    const whole=evs.filter(a=>!(a.target.criterion_id));
-    evs.forEach(a=>{if(a.target.criterion_id&&vmap[a.target.criterion_id]!==undefined)vmap[a.target.criterion_id]=a.verdict});
-    if(whole.length)Object.keys(vmap).forEach(k=>{if(!evs.some(a=>a.target.criterion_id===k))vmap[k]=whole[whole.length-1].verdict});
-    const g=gates.get(seq), d=!!(g&&g.result==="PASS"), vals=Object.values(vmap);
-    if(d)delivered++;
-    const ok=d&&(vals.length>0?vals.every(v=>v==="PASS")
-                 :(whole.length>0&&whole[whole.length-1].verdict==="PASS"));
-    if(ok)accepted++;else open++;
-  });
-  L.push("## v1.2 分片（切割点之后）","");
-  L.push(`- legacy ${legacyRows.length} 行（seq≤${cutRow.freezes_seq_lte}，只计旧 S1，自评口径见下表）`);
-  L.push(`- v1.2：task ${tasks.size} / gate ${gates.size} / accept ${acc.length} → delivered ${delivered} / accepted ${accepted} / open ${open}`);
-  L.push("- 两套口径分开，不相加；`accepted` 只认外部 accept 事件折叠出的全 PASS");
-  L.push("");
-}
-L.push("## 成功率","| 结果 | 数量 | 占比 |","|---|---|---|");
-L.push(`| ✅ 成功 | ${c.success} | ${pct(c.success)}% |`);
-L.push(`| ⚠️ 部分达成 | ${c.partial} | ${pct(c.partial)}% |`);
-L.push(`| ❌ 失败 | ${c.fail} | ${pct(c.fail)}% |`);
-if(c.unknown)L.push(`| ❓ 未知 | ${c.unknown} | ${pct(c.unknown)}% |`);
-L.push("","## 外部判定（acceptance.verdict）","| 判定 | 条数 |","|---|---|");
-L.push(`| PASS | ${verdicts.PASS} |`);
-L.push(`| FAIL | ${verdicts.FAIL} |`);
-L.push(`| UNKNOWN | ${verdicts.UNKNOWN} |`);
-L.push("",`- 返工（red_attempts）合计 ${red} 次；degraded 记录 ${degraded} 条`);
-if(v10===0)L.push("- 注意：本次统计没有 v1.0 记录，外部判定列为空属于正常");
-L.push("","## 工具使用");
-const tlist=Object.entries(tools).sort((a,b)=>b[1]-a[1]);
-L.push(tlist.length?tlist.map(([k,v])=>`- \`${k}\` × ${v}`).join("\n"):"- 无记录（v1.0 schema 不再记 tools 字段）");
-L.push("","## 未一次成功的任务");
-if(fails.length){fails.slice(-15).forEach(f=>{L.push(`- **${f.task}**（${bucket(f)}，seq=${f.seq}）`);
-  const why=f.why||f.evidence; if(why)L.push(`  - 依据：${why}`);
-  const les=f.lesson||f.review; if(les)L.push(`  - 复盘：${String(les).slice(0,200)}`);});}
-else L.push("- 无，全部一次通过");
-L.push("","## 经验汇总");
-const lso=Object.entries(lessons).sort((a,b)=>b[1]-a[1]).slice(0,12);
-L.push(lso.length?lso.map(([k,v])=>`- ${k}（×${v}）`).join("\n"):"- 无");
-L.push("","## 改进措施（自动推导）");
-const adv=[];
-if(c.fail>0) adv.push(`- 有 ${c.fail} 个失败任务，先复盘「依据」列找重复模式`);
-if(verdicts.FAIL>0) adv.push(`- 外部判定 FAIL ${verdicts.FAIL} 条：自评与外部判定不一致，收尾补验证再报完成`);
-if(c.partial>Math.max(1,n*0.2)) adv.push(`- 部分达成 ${pct(c.partial)}%，交付但没验证的情况偏多，收尾要补验证`);
-if(degraded>0) adv.push(`- 有 ${degraded} 条 degraded：通道失效时靠可粘贴件交付，下一轮要补严格判据`);
-const tt=tlist[0];
-if(tt&&tt[1]>n*2) adv.push(`- \`${tt[0]}\` 被调 ${tt[1]} 次，考虑批量化`);
-if(lso.length&&lso[0][1]>=3) adv.push(`- 同一条教训出现 ${lso[0][1]} 次：${lso[0][0]} —— 该写成硬规则`);
-adv.push("- 样本少于 10 条时不下结论");
-L.push(adv.join("\n"));
-const stamp=new Date().toLocaleString("sv-SE",{timeZone:"Asia/Shanghai"}).slice(0,10);
-fs.mkdirSync(OUTDIR,{recursive:true});
-const out=path.join(OUTDIR,`任务总结-${stamp}.md`);
-fs.writeFileSync(out,L.join("\n"));
-console.log("报告:",out);
-console.log(`总任务 ${n} | 成功 ${c.success} (${pct(c.success)}%) | 部分 ${c.partial} | 失败 ${c.fail} | PASS ${verdicts.PASS} FAIL ${verdicts.FAIL}`);
-' "$DAYS"
+#!/usr/bin/env python3
+"""task-report [天数] — 周期报告（唯一统计实现是 bin/v12-model）
+
+输出目录优先级：$TASK_REPORT_DIR → $DSH_HOME/reports-dir 文件里的一行 → $DSH_HOME/reports/
+两套口径分开写，绝不相加。
+"""
+import json, os, subprocess, sys, pathlib, datetime
+
+HOME = pathlib.Path(os.environ.get("DSH_HOME", pathlib.Path.home() / ".dsh"))
+LOG = pathlib.Path(os.environ.get("TASK_LOG", HOME / "task-log.jsonl"))
+days = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 0
+
+
+def outdir():
+    d = os.environ.get("TASK_REPORT_DIR")
+    if d:
+        return pathlib.Path(d)
+    cfg = HOME / "reports-dir"
+    if cfg.exists():
+        v = cfg.read_text(encoding="utf-8").strip()
+        if v:
+            return pathlib.Path(v)
+    return HOME / "reports"
+
+
+model = HOME / "bin" / "v12-model"
+if not model.exists():
+    print("v12-model 未安装（scripts/install.sh）"); sys.exit(1)
+run = subprocess.run([sys.executable, str(model)], capture_output=True, text=True,
+                     env=dict(os.environ, TASK_LOG=str(LOG)))
+if run.returncode != 0:
+    print(run.stdout + run.stderr); sys.exit(run.returncode)
+d = json.loads(run.stdout)
+if not d.get("legacy"):
+    print("没有记录"); sys.exit(0)
+
+rows = [json.loads(l) for l in LOG.read_text(encoding="utf-8").split("\n") if l.strip()]
+if days > 0:
+    cut = datetime.datetime.now().timestamp() - days * 86400
+    def keep(r):
+        try:
+            return datetime.datetime.fromisoformat(r.get("ts", "")).timestamp() >= cut
+        except Exception:
+            return False
+    rows = [r for r in rows if keep(r)]
+
+L, M = d["legacy"], d.get("modern")
+n = L["rows"]
+pct = lambda x, n2: round(x / n2 * 100) if n2 else 0
+bucket = lambda r: ("success" if r.get("status", r.get("result")) in ("done", "success")
+                    else "fail" if r.get("status", r.get("result")) in ("blocked", "fail")
+                    else "partial" if r.get("status", r.get("result")) == "partial" else "unknown")
+
+rep = ["# 任务总结报告", ""]
+rep.append(f"- 生成时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+rep.append(f"- 统计范围：{'最近 ' + str(days) + ' 天' if days else '全部记录'}"
+           f"（legacy/自评集 {n} 条；v1.0 schema {L['with_status']} 条）")
+rep.append("")
+
+if M:
+    rep += ["## v1.2 分片（切割点之后）", "",
+            f"- legacy {n} 行（seq≤{d['freezes_seq_lte']}，只计旧 S1，"
+            f"{'干净' if L['seq_ok'] else '有问题'}）",
+            f"- v1.2：task {M['tasks']} / gate {M['gates']} / accept {M['accepts']} → "
+            f"delivered {M['delivered']} / accepted {M['accepted']} / open {M['open']}",
+            "- 两套口径分开，不相加；`accepted` 只认外部 accept 事件折叠出的全 PASS", ""]
+
+rep += ["## 成功率", "| 结果 | 数量 | 占比 |", "|---|---|---|",
+        f"| ✅ 成功 | {L['success']} | {pct(L['success'], n)}% |",
+        f"| ⚠️ 部分达成 | {L['partial']} | {pct(L['partial'], n)}% |",
+        f"| ❌ 失败 | {L['fail']} | {pct(L['fail'], n)}% |"]
+if L["unknown"]:
+    rep.append(f"| ❓ 未知 | {L['unknown']} | {pct(L['unknown'], n)}% |")
+v = L["verdicts"]
+rep += ["", "## 外部判定（acceptance.verdict）", "| 判定 | 条数 |", "|---|---|",
+        f"| PASS | {v['PASS']} |", f"| FAIL | {v['FAIL']} |", f"| UNKNOWN | {v['UNKNOWN']} |",
+        "", f"- 返工（red_attempts）合计 {L['red']} 次；degraded 记录 {L['degraded']} 条"]
+
+rep += ["", "## 工具使用"]
+rep += [f"- `{k}` × {c}" for k, c in L["tools"].items()] or ["- 无记录"]
+
+fails = [r for r in rows if bucket(r) != "success"]
+rep += ["", "## 未一次成功的任务"]
+if fails:
+    for f in fails[-15:]:
+        rep.append(f"- **{f.get('task')}**（{bucket(f)}，seq={f.get('seq')}）")
+else:
+    rep.append("- 无，全部一次通过")
+
+lessons = {}
+for r in rows:
+    les = r.get("lesson") or (r.get("improve") or {}).get("finding")
+    if les:
+        lessons[les] = lessons.get(les, 0) + 1
+rep += ["", "## 经验汇总"]
+rep += [f"- {k}（×{c}）" for k, c in sorted(lessons.items(), key=lambda kv: -kv[1])[:12]] or ["- 无"]
+
+adv = []
+if L["fail"]:
+    adv.append(f"- 有 {L['fail']} 个失败任务，先复盘「依据」列找重复模式")
+if v["FAIL"]:
+    adv.append(f"- 外部判定 FAIL {v['FAIL']} 条：自评与外部判定不一致，收尾补验证再报完成")
+if L["partial"] > max(1, n * 0.2):
+    adv.append(f"- 部分达成 {pct(L['partial'], n)}%，交付但没验证的情况偏多")
+if M and M["accepted"] == 0 and M["tasks"] > 0:
+    adv.append("- v1.2 里 accepted 为 0：验收事件没人签，机制最核心那一步没走")
+if L["degraded"]:
+    adv.append(f"- 有 {L['degraded']} 条 degraded：下一轮要补严格判据")
+adv.append("- 样本少于 10 条时不下结论")
+rep += ["", "## 改进措施（自动推导）"] + adv
+
+out = outdir()
+out.mkdir(parents=True, exist_ok=True)
+p = out / f"任务总结-{datetime.date.today().isoformat()}.md"
+p.write_text("\n".join(rep) + "\n", encoding="utf-8")
+print("报告:", p)
+print(f"legacy {n} 条 | 成功 {L['success']} | 失败 {L['fail']}"
+      + (f" | v1.2 accepted {M['accepted']}/{M['tasks']}" if M else ""))

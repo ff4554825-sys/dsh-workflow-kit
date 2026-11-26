@@ -69,3 +69,19 @@ def test_accept_by_self_is_refused():
                     "--reviewer", me, "--pointer", "x")
     assert code == 1 and "自己审自己" in out, out
     assert len((home / "task-log.jsonl").read_text(encoding="utf-8").strip().split("\n")) == 4
+
+
+def test_model_is_single_source_for_stats_and_report():
+    """task-stats 与 task-report 必须同源：accepted 数字一致。"""
+    home = sandbox()
+    seed(home, [{"seq": 1, "ts": "2026-11-25T09:00:00+08:00", "task": "老", "status": "done"}])
+    run(home, "--cut")
+    run(home, "--lite", "--task", "新", "--evidence", "e", "--gate", "PASS")
+    run(home, "--accept", "--target-seq", "3", "--verdict", "PASS",
+        "--reviewer", "user", "--pointer", "x")
+    code, stats = run(home, cmd="task-stats")
+    repdir = home / "reports"
+    env = dict(os.environ, DSH_HOME=str(home), TASK_REPORT_DIR=str(repdir))
+    subprocess.run([PY, str(home / "bin" / "task-report")], capture_output=True, text=True, env=env)
+    md = next(repdir.glob("*.md")).read_text(encoding="utf-8")
+    assert "accepted 1" in stats and "accepted 1" in md, (stats, md[:400])
