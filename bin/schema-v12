@@ -381,7 +381,7 @@ def main(argv):
             errs.append(e("V14", seals[1][1], "一个分片只允许一条 seal 事件"))
         sidx, sln, sr = seals[0]
         errs += check_seal(sr, sln, rows, sidx)
-        prev = canon(rows[sidx])
+        prev = canon(rows[sidx][1])   # rows 是 (行号, 对象) 元组
         for j in range(sidx + 1, len(rows)):
             rj = rows[j][1]
             if not isinstance(rj, dict):

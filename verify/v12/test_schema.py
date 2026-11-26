@@ -257,3 +257,17 @@ def test_hex_hash_with_digits_is_not_red():
     t = base_task(evidence="sha256 4f1e9c2a77b0d3e5f60718293a4b5c6d7e8f9012345678abcdef0123456789ab")
     code, out = run([t])
     assert code == 0, out
+
+
+def test_valid_chain_after_seal_passes():
+    """seal 之后正常写一行（prev_hash 正确）必须绿——防止只测了断开的一侧。"""
+    import hashlib
+    canon = lambda r: json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    rows = _sealed_log()
+    seal = _seal_rows(rows)
+    t = {"record_type": "task", "session_id": "s1", "seq": 4,
+         "ts": "2026-11-25T10:02:00+08:00", "executor_id": "ex-1", "task": "t",
+         "tier": "lite", "status": "done", "evidence": "e",
+         "prev_hash": hashlib.sha256(canon(seal).encode()).hexdigest()}
+    code, out = run(rows + [seal, t])
+    assert code == 0, out
