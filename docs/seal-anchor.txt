@@ -1,0 +1,5 @@
+# 外部锚点：把日志前缀摘要钉在仓库里
+# 校验：读 ~/.dsh/task-log.jsonl 的前 through_seq 行，按规范形拼起来算 sha256，必须等于 digest
+seal_seq=47
+through_seq=46
+digest=78ddc6eff938bf2f94140497b7060969b7438961e1b9e350b0d7e5c3bb153e5d
